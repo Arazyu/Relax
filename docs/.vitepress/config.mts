@@ -262,8 +262,7 @@ export default defineConfig({
                 { text: 'Architecture', link: '/en/guide/architecture' },
                 { text: 'Dataset Design', link: '/en/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
-                { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
-                { text: 'Unified Inference Validation', link: '/en/guide/unified-inference-validation' }
+                { text: 'Health Check Manager', link: '/en/guide/health-check-manager' }
               ]
             },
             {
@@ -382,8 +381,7 @@ export default defineConfig({
                 { text: '架构设计', link: '/zh/guide/architecture' },
                 { text: '数据集设计', link: '/zh/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
-                { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
-                { text: '统一推理服务验收记录', link: '/zh/guide/unified-inference-validation' }
+                { text: '健康检查管理器', link: '/zh/guide/health-check-manager' }
               ]
             },
             {

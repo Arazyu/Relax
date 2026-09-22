@@ -469,7 +469,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         async def set_rollout_manager(self, _manager):
             events.append("set_rollout_manager")
 
-        def update_weights_fully_async(self):
+        def update_weights_fully_async(self, rollout_only=False, actor_fwd_only=False):
             async def update():
                 events.append("update_weights")
 
@@ -508,6 +508,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
     instance._restarting = False
+    instance._metrics_service_enabled = False
     monkeypatch.setattr(controller, "set_managed_opd_teacher_on_actor_service", lambda *_args: _async_noop())
     monkeypatch.setattr(instance, "_cleanup_s3_model_weights_after_init", lambda: events.append("cleanup"))
 

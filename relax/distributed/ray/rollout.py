@@ -3433,10 +3433,18 @@ class RolloutManager(ReloadableMixin):
             result["models"][name] = model_info
             result["total_engines"] += model_info["total_engines"]
 
-        snapshot = self.get_inference_snapshot()
-        for name, info in result["models"].items():
-            info.update(snapshot["models"][name])
-        result.update({key: value for key, value in snapshot.items() if key != "models"})
+        # Keep the legacy manager-only construction path usable.  Some callers
+        # (including older reloaded actors and lightweight test managers) expose
+        # ``servers`` without the unified InferenceManager; in that case the
+        # legacy engine-info payload is still complete and must not require the
+        # new discovery state.
+        inference = getattr(self, "inference", None)
+        if inference is not None:
+            snapshot = self.get_inference_snapshot()
+            for name, info in result["models"].items():
+                if name in snapshot["models"]:
+                    info.update(snapshot["models"][name])
+            result.update({key: value for key, value in snapshot.items() if key != "models"})
         return result
 
     @ray.method(concurrency_group="scale_out")
