@@ -4,6 +4,8 @@ outline: deep
 
 # GenRM 服务 API
 
+共享 API、Placement 和 defer 模式见[统一推理服务](./inference.md)。
+
 GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 Ray Serve 部署方式运行，通过 FastAPI ingress 暴露 HTTP 端点。
 
 ## 概览

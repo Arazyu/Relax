@@ -4,6 +4,8 @@ outline: deep
 
 # Rollout Service API
 
+See [Unified inference service](./inference.md) for shared routing, discovery, and lifecycle behavior.
+
 The Rollout service generates training samples using SGLang engines. It is deployed as a Ray Serve deployment with a FastAPI ingress, exposing HTTP endpoints for lifecycle management, evaluation, and async weight-update coordination.
 
 ## Overview

@@ -4,6 +4,8 @@ outline: deep
 
 # GenRM Service API
 
+See [Unified inference service](./inference.md) for shared APIs, placement, and deferred execution.
+
 The GenRM (Generative Reward Model) service provides LLM-based response evaluation. It is deployed as a Ray Serve deployment with a FastAPI ingress.
 
 ## Overview

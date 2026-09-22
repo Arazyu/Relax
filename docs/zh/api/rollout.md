@@ -4,6 +4,8 @@ outline: deep
 
 # Rollout 服务 API
 
+三类推理角色共用的路由、discovery 和生命周期见[统一推理服务](./inference.md)。
+
 Rollout 服务通过 SGLang 引擎生成训练样本。它以 Ray Serve 部署方式运行，通过 FastAPI ingress 暴露 HTTP 端点，用于生命周期管理、评估触发和异步权重更新协调。
 
 ## 概览

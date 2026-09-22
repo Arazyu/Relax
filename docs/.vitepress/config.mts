@@ -262,7 +262,8 @@ export default defineConfig({
                 { text: 'Architecture', link: '/en/guide/architecture' },
                 { text: 'Dataset Design', link: '/en/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
-                { text: 'Health Check Manager', link: '/en/guide/health-check-manager' }
+                { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
+                { text: 'Unified Inference Validation', link: '/en/guide/unified-inference-validation' }
               ]
             },
             {
@@ -314,6 +315,7 @@ export default defineConfig({
                 { text: 'Actor', link: '/en/api/actor' },
                 { text: 'Rollout', link: '/en/api/rollout' },
                 { text: 'GenRM', link: '/en/api/genrm' },
+                { text: 'Unified Inference', link: '/en/api/inference' },
                 { text: 'ActorFwd', link: '/en/api/actor-fwd' }
               ]
             }
@@ -380,7 +382,8 @@ export default defineConfig({
                 { text: '架构设计', link: '/zh/guide/architecture' },
                 { text: '数据集设计', link: '/zh/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
-                { text: '健康检查管理器', link: '/zh/guide/health-check-manager' }
+                { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
+                { text: '统一推理服务验收记录', link: '/zh/guide/unified-inference-validation' }
               ]
             },
             {
@@ -432,6 +435,7 @@ export default defineConfig({
                 { text: 'Actor', link: '/zh/api/actor' },
                 { text: 'Rollout', link: '/zh/api/rollout' },
                 { text: 'GenRM', link: '/zh/api/genrm' },
+                { text: '统一推理服务', link: '/zh/api/inference' },
                 { text: 'ActorFwd', link: '/zh/api/actor-fwd' }
               ]
             }
