@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Run production startup methods with RPC boundaries stubbed, without Ray/GPU imports."""
+"""Run production startup methods with RPC boundaries stubbed, without Ray/GPU
+imports."""
 
 import ast
 import asyncio
@@ -58,7 +59,9 @@ async def test_actor_startup_remains_responsive_and_waits_for_rpc(phase):
         loop.call_soon_threadsafe(started.set)
         assert release.wait(2), "Test did not release startup RPC"
 
-    method = {"bind": "set_rollout_manager", "sync": "update_weights", "fully_async": "update_weights_fully_async"}[phase]
+    method = {"bind": "set_rollout_manager", "sync": "update_weights", "fully_async": "update_weights_fully_async"}[
+        phase
+    ]
     getattr(actor.actor_model, method).side_effect = blocking_rpc
     manager = object()
     request = (
@@ -85,7 +88,9 @@ async def test_actor_startup_remains_responsive_and_waits_for_rpc(phase):
         actor.actor_model.update_weights.assert_called_once_with()
 
 
-@pytest.mark.parametrize("fully_async,hybrid,sft,expected", [(True, False, False, 0), (True, True, False, 1), (False, False, True, 0)])
+@pytest.mark.parametrize(
+    "fully_async,hybrid,sft,expected", [(True, False, False, 0), (True, True, False, 1), (False, False, True, 0)]
+)
 async def test_actor_startup_preserves_weight_sync_modes(fully_async, hybrid, sft, expected):
     actor = _actor()
     actor.config = SimpleNamespace(fully_async=fully_async, hybrid=hybrid, sft=sft)
@@ -96,7 +101,9 @@ async def test_actor_startup_preserves_weight_sync_modes(fully_async, hybrid, sf
 @pytest.mark.parametrize("phase", ["bind", "sync", "fully_async"])
 async def test_actor_startup_propagates_rpc_failure(phase):
     actor = _actor()
-    name = {"bind": "set_rollout_manager", "sync": "update_weights", "fully_async": "update_weights_fully_async"}[phase]
+    name = {"bind": "set_rollout_manager", "sync": "update_weights", "fully_async": "update_weights_fully_async"}[
+        phase
+    ]
     getattr(actor.actor_model, name).side_effect = RuntimeError("weight transaction failed")
     with pytest.raises(RuntimeError, match="weight transaction failed"):
         if phase == "fully_async":
@@ -119,9 +126,7 @@ async def test_actor_initial_sync_skipping_rollout_does_not_publish_readiness(ro
 
 
 def _service_class():
-    return _load_class(
-        "relax/core/service.py", "Service", ("update_weights_fully_async", "recv_weight_fully_async")
-    )
+    return _load_class("relax/core/service.py", "Service", ("update_weights_fully_async", "recv_weight_fully_async"))
 
 
 @pytest.mark.parametrize("method", ["update_weights_fully_async", "recv_weight_fully_async"])
@@ -168,7 +173,9 @@ def test_controller_initial_sync_starts_all_peers_and_gates_training(failed):
         logger=Mock(),
     )
     controller = controller_cls()
-    controller.config = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, fully_async=True, hybrid=False)
+    controller.config = SimpleNamespace(
+        debug_train_only=False, debug_rollout_only=False, fully_async=True, hybrid=False
+    )
     controller._teacher_manager = None
     controller._pending_task_refs_lock = threading.Lock()
     controller._restarting = False
@@ -212,7 +219,8 @@ def test_controller_initial_sync_starts_all_peers_and_gates_training(failed):
 
 
 def test_controller_decoupled_initial_sync_is_rollout_only():
-    """A pure actor+rollout topology must not initialize absent forward consumers."""
+    """A pure actor+rollout topology must not initialize absent forward
+    consumers."""
     events = []
     roles = SimpleNamespace(actor="actor", actor_fwd="actor_fwd", reference="reference", rollout="rollout")
     service_cls = _service_class()
@@ -232,7 +240,9 @@ def test_controller_decoupled_initial_sync_is_rollout_only():
         logger=Mock(),
     )
     controller = controller_cls()
-    controller.config = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, fully_async=True, hybrid=False)
+    controller.config = SimpleNamespace(
+        debug_train_only=False, debug_rollout_only=False, fully_async=True, hybrid=False
+    )
     controller._teacher_manager = None
     controller._pending_task_refs_lock = threading.Lock()
     controller._restarting = False

@@ -159,7 +159,8 @@ class Actor(Base):
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
     async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
-        """Publish initial fully-async weights without blocking Serve probes."""
+        """Publish initial fully-async weights without blocking Serve
+        probes."""
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,

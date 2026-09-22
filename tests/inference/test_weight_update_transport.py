@@ -62,7 +62,9 @@ def _load_update_bucket(dist):
     path = ROOT / "relax/distributed/checkpoint_service/backends/device_direct.py"
     tree = ast.parse(path.read_text())
     backend = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeviceDirectBackend")
-    method = next(node for node in backend.body if getattr(node, "name", None) == "_update_bucket_weights_from_distributed")
+    method = next(
+        node for node in backend.body if getattr(node, "name", None) == "_update_bucket_weights_from_distributed"
+    )
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
         type_ignores=[],

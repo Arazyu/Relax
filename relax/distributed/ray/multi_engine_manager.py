@@ -67,9 +67,9 @@ def _is_actor_dead(exc: BaseException) -> bool:
     """Return whether Ray has already lost the engine actor itself.
 
     A transport timeout is ambiguous: the SGLang process may still own GPU
-    memory and must stay pending until ``shutdown`` succeeds.  RayActorError
-    is different.  It means the actor process is gone, so a cleanup attempt
-    can acknowledge that slot and let recovery rebuild it.
+    memory and must stay pending until ``shutdown`` succeeds.  RayActorError is
+    different.  It means the actor process is gone, so a cleanup attempt can
+    acknowledge that slot and let recovery rebuild it.
     """
 
     return isinstance(exc, ray.exceptions.RayActorError)

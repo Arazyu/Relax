@@ -992,8 +992,8 @@ class DeviceDirectBackend(CommBackend):
         broadcasts. This function blocks until all broadcasts and remote
         updates complete. The independent fully-async topology uses SGLang's
         flattened bucket protocol so one cross-node update is one collective
-        per bucket instead of hundreds of queued collectives. SGLang stores
-        the bucket as bytes, so the sender must use the same byte-level layout;
+        per bucket instead of hundreds of queued collectives. SGLang stores the
+        bucket as bytes, so the sender must use the same byte-level layout;
         this also preserves mixed-dtype buckets.
         """
 
