@@ -168,6 +168,13 @@ class Actor(Base):
             rollout_only,
             actor_fwd_only,
         )
+        # The async DCS path does not call the synchronous update_weights
+        # readiness hook.  Publish readiness only after the transfer has
+        # completed successfully so the initial rollout can accept requests
+        # before the first training step.  An actor_fwd-only update must not
+        # make the rollout ingress ready.
+        if not actor_fwd_only and getattr(self, "rollout_manager", None) is not None:
+            await self.rollout_manager.set_policy_weights_ready.remote(True)
 
     async def run(self) -> None:
         """Start the training loop in a background thread and async-wait until

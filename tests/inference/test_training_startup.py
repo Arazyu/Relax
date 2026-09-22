@@ -41,6 +41,7 @@ def _actor():
     actor = cls()
     actor.config = SimpleNamespace(fully_async=False, hybrid=False, sft=False)
     actor.actor_model = Mock()
+    actor.rollout_manager = SimpleNamespace(set_policy_weights_ready=SimpleNamespace(remote=AsyncMock()))
     return actor
 
 
@@ -77,6 +78,7 @@ async def test_actor_startup_remains_responsive_and_waits_for_rpc(phase):
         await task
     if phase == "fully_async":
         actor.actor_model.update_weights_fully_async.assert_called_once_with(0, True, False)
+        actor.rollout_manager.set_policy_weights_ready.remote.assert_awaited_once_with(True)
     else:
         assert actor.rollout_manager is manager
         actor.actor_model.set_rollout_manager.assert_called_once_with(manager)
@@ -103,6 +105,17 @@ async def test_actor_startup_propagates_rpc_failure(phase):
             await actor.set_rollout_manager(object())
     if phase == "bind":
         actor.actor_model.update_weights.assert_not_called()
+    elif phase == "fully_async":
+        actor.rollout_manager.set_policy_weights_ready.remote.assert_not_awaited()
+
+
+@pytest.mark.parametrize("rollout_only", [False, True])
+async def test_actor_initial_sync_skipping_rollout_does_not_publish_readiness(rollout_only):
+    actor = _actor()
+
+    await actor.update_weights_fully_async(rollout_only=rollout_only, actor_fwd_only=True)
+
+    actor.rollout_manager.set_policy_weights_ready.remote.assert_not_awaited()
 
 
 def _service_class():

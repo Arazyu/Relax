@@ -88,6 +88,39 @@ async def test_gateway_health_reports_failed_models():
     await gateway.aclose()
 
 
+async def test_gateway_admits_generation_after_initial_weight_sync():
+    data = snapshot()
+    data["models"] = {"a": {**data["models"]["a"], "router_url": "http://backend", "state": "unavailable"}}
+    manager = SimpleNamespace(
+        get_inference_snapshot=SimpleNamespace(remote=lambda: asyncio.sleep(0, result=data)),
+    )
+    gateway = InferenceGateway("rollout", {"default": manager})
+    backend = httpx.MockTransport(lambda request: httpx.Response(200, json={"text": "initial policy"}))
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=backend)
+    app = FastAPI()
+
+    @app.get("/engines")
+    async def engines():
+        return await gateway.discovery()
+
+    @app.post("/generate")
+    async def generate(request: Request):
+        return await gateway.forward(request, "generate")
+
+    payload = {"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 1}}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://gateway") as client:
+        blocked = await client.post("/generate", json=payload)
+        assert blocked.status_code == 503
+
+        data["models"]["a"]["state"] = "ready"
+        admitted = await client.post("/generate", json=payload)
+        assert admitted.status_code == 200
+        assert admitted.json() == {"text": "initial policy"}
+
+    await gateway.aclose()
+
+
 def test_manager_idempotency_partial_onload_and_immutable_snapshots():
     owner = InferenceManager("teacher")
     models = snapshot()["models"]
