@@ -147,11 +147,12 @@ class TeacherManager(MultiEngineManager):
             )
         return self._replica_pgs[replica], True, node_offset
 
-    def _remove_owned_pg(self, rank: int) -> None:
-        super()._remove_owned_pg(rank)
+    def _remove_owned_pg(self, rank: int) -> bool:
+        removed = super()._remove_owned_pg(rank)
         replica = rank // self.nodes_per_engine
         if not any(i // self.nodes_per_engine == replica for i in self._engine_placements):
             self._replica_pgs.pop(replica, None)
+        return removed
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         fraction = getattr(self.args, "_inference_ray_gpu_fraction", 0.2)

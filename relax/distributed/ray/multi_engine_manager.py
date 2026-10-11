@@ -114,6 +114,17 @@ class MultiEngineManager:
         self._engine_addr_and_ports: dict[int, dict] = {}
         self._initializing_ranks: set[int] = set()
         self._cleanup_pending: set[int] = set()
+        # Ranks whose owned placement-group removal failed and whose handle is
+        # retained for retry (Task 4: unconfirmed resource release keeps
+        # blocking new scale operations until reconcile succeeds).
+        self._pending_pg_cleanup: set[int] = set()
+        # Ranks for which remove_placement_group() was *accepted* by Ray.
+        # Distinct from _pending_pg_cleanup (which means "release not yet
+        # confirmed REMOVED"): a rank whose deletion submission itself threw
+        # must stay out of this set so the next retry resubmits the deletion
+        # instead of only polling a PG that was never deleted (review finding:
+        # first-attempt exception otherwise strands the PG in CREATED forever).
+        self._pg_remove_submitted: set[int] = set()
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
@@ -249,25 +260,78 @@ class MultiEngineManager:
         finally:
             self._initializing_ranks.difference_update(pending_ranks)
 
-    def _remove_owned_pg(self, rank: int) -> None:
+    def _remove_owned_pg(self, rank: int) -> bool:
+        """Remove the placement group this manager owns for ``rank``.
+
+        Returns True when the slot had no owned PG or removal succeeded. On
+        removal failure the handle is retained (put back into
+        ``_engine_placements``) and the rank is recorded in
+        ``_pending_pg_cleanup`` for reconcile retries, so the resource stays
+        accounted-for instead of silently leaking.
+        """
+        # ``remove_placement_group`` only submits an asynchronous deletion.
+        # Keep ownership until Ray reports REMOVED; treating an accepted RPC as
+        # resource release lets a replacement actor race the old PG.
         placement = self._engine_placements.get(rank)
         if placement is None:
-            return
+            return True
         pg_tuple, owns_pg = placement
         if not owns_pg:
-            self._engine_placements.pop(rank)
-            return
+            self._engine_placements.pop(rank, None)
+            return True
         if any(i != rank and other[0][0] == pg_tuple[0] for i, other in self._engine_placements.items()):
-            self._engine_placements.pop(rank)
-            return
-        from ray.util.placement_group import remove_placement_group
+            self._engine_placements.pop(rank, None)
+            return True
+        try:
+            from ray.util.placement_group import placement_group_table, remove_placement_group
 
-        remove_placement_group(pg_tuple[0])
-        self._engine_placements.pop(rank)
+            if rank not in self._pg_remove_submitted:
+                remove_placement_group(pg_tuple[0])
+                # Ray accepted the (asynchronous) deletion request.
+                self._pg_remove_submitted.add(rank)
+            # Deletion submitted but not yet confirmed REMOVED: the rank is
+            # pending cleanup either way, so reconcile keeps retrying the
+            # confirmation poll.
+            self._pending_pg_cleanup.add(rank)
+            state = placement_group_table(pg_tuple[0]).get("state")
+            if state == "REMOVED":
+                self._engine_placements.pop(rank, None)
+                self._pending_pg_cleanup.discard(rank)
+                self._pg_remove_submitted.discard(rank)
+                if self.all_engines[rank] is None:
+                    self._cleanup_pending.discard(rank)
+                return True
+            return False
+        except Exception as exc:
+            logger.warning(f"{self._log_prefix} remove placement group for rank={rank} failed: {exc}")
+            # The deletion may never have reached Ray (the exception can fire
+            # before or during submission). Retain the handle, mark the rank
+            # for reconcile retries, and -- crucially -- leave it out of
+            # _pg_remove_submitted so the next attempt resubmits the deletion.
+            self._pending_pg_cleanup.add(rank)
+            self._pg_remove_submitted.discard(rank)
+            return False
+
+    def retry_pending_pg_cleanup(self) -> list[int]:
+        """Retry PG removal for all failed-cleanup ranks.
+
+        Returns the ranks still failing cleanup after this attempt.
+        """
+        still_failing: list[int] = []
+        for rank in sorted(self._pending_pg_cleanup):
+            if self._remove_owned_pg(rank):
+                self._pending_pg_cleanup.discard(rank)
+            else:
+                still_failing.append(rank)
+        return still_failing
 
     def _require_cleanup_complete(self) -> None:
-        if self._cleanup_pending:
-            raise RuntimeError(f"Inference cleanup pending for ranks={sorted(self._cleanup_pending)}")
+        pending = self._cleanup_pending | self._pending_pg_cleanup
+        if pending:
+            raise RuntimeError(f"Inference cleanup pending for ranks={sorted(pending)}")
+
+    def _release_slot_pg(self, rank: int) -> bool:
+        return self._remove_owned_pg(rank)
 
     def _cleanup_slots(self, ranks: list[int]) -> None:
         ranks = sorted(set(ranks))
@@ -283,7 +347,8 @@ class MultiEngineManager:
                     ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
                     ray.kill(engine)
                     self.all_engines[rank] = None
-                self._remove_owned_pg(rank)
+                if not self._release_slot_pg(rank):
+                    raise RuntimeError(f"Placement group release is unconfirmed for rank={rank}")
                 self._cleanup_pending.discard(rank)
             except Exception as exc:
                 if engine is not None and _is_actor_dead(exc):
@@ -301,7 +366,8 @@ class MultiEngineManager:
                             )
                             continue
                     try:
-                        self._remove_owned_pg(rank)
+                        if not self._release_slot_pg(rank):
+                            raise RuntimeError(f"Placement group release is unconfirmed for rank={rank}")
                     except Exception as pg_exc:
                         failures.append(pg_exc)
                         logger.warning(
@@ -326,10 +392,25 @@ class MultiEngineManager:
     # Health / lifecycle.
     # ------------------------------------------------------------------
 
+    def _managed_ranks(self) -> list[int]:
+        """Slots participating in pool health and recovery."""
+        return list(range(len(self.all_engines)))
+
+    def _engine_state(self, rank: int) -> str:
+        group = range(rank, rank + self.nodes_per_engine)
+        if any(i in self._initializing_ranks for i in group):
+            return "starting"
+        if any(i in self._cleanup_pending or i in self._pending_pg_cleanup for i in group):
+            return "draining"
+        return "ready" if all(self.all_engines[i] is not None for i in group) else "dead"
+
     def health_check(self) -> bool:
         """Perform a health check on every engine."""
         health_results = []
-        for engine in self.engines:
+        for rank in self._managed_ranks():
+            if rank % self.nodes_per_engine:
+                continue
+            engine = self.all_engines[rank]
             if engine is not None:
                 try:
                     health_results.append(ray.get(engine.health_generate.remote(), timeout=5.0))
@@ -342,7 +423,7 @@ class MultiEngineManager:
 
     def onload(self, tags: Optional[list[str]] = None) -> None:
         self._require_cleanup_complete()
-        if self.inference.state != "dead" and any(engine is None for engine in self.all_engines):
+        if self.inference.state != "dead" and any(self.all_engines[i] is None for i in self._managed_ranks()):
             self.inference.state = "failed"
         self.inference.transition("activate", lambda: self._onload_engines(tags), tags)
 
@@ -434,7 +515,7 @@ class MultiEngineManager:
         bound, so they're skipped).
         """
         self._require_cleanup_complete()
-        dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
+        dead = [i for i in self._managed_ranks() if self.all_engines[i] is None]
         if not dead:
             return set()
 
@@ -488,16 +569,12 @@ class MultiEngineManager:
     def get_inference_snapshot(self) -> dict:
         engines = []
         for rank in range(0, len(self.all_engines), self.nodes_per_engine):
-            live = all(
-                self.all_engines[i] is not None and i not in self._initializing_ranks
-                for i in range(rank, rank + self.nodes_per_engine)
-            )
             address = self._engine_addr_and_ports.get(rank, {})
             host = address.get("host")
             if host and ":" in host and not host.startswith("["):
                 host = f"[{host}]"
             url = f"http://{host}:{address['port']}" if host and "port" in address else None
-            engines.append(engine_record(f"default/{rank // self.nodes_per_engine}", url, "ready" if live else "dead"))
+            engines.append(engine_record(f"default/{rank // self.nodes_per_engine}", url, self._engine_state(rank)))
         state = "ready" if any(e["direct_eligible"] for e in engines) else "dead"
         aliases = []
         for attr in ("genrm_model_path", "teacher_hf_checkpoint", "sglang_hf_checkpoint", "hf_checkpoint"):

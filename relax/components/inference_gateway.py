@@ -5,11 +5,13 @@
 import asyncio
 import json
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from relax.inference.routing import RoutingError, select_endpoint, select_model
 
@@ -25,7 +27,11 @@ class InferenceGateway:
         tokenizers: dict | None = None,
         instance_specs: dict | None = None,
         model_aliases: dict[str, list[str]] | None = None,
+        legacy_generate: Callable[[str, dict], Awaitable[dict]] | None = None,
+        start_request: Callable[[str, str, str | None], Callable[[], None]] | None = None,
     ) -> None:
+        self.legacy_generate = legacy_generate
+        self.start_request = start_request
         self.role = role
         self.managers = managers
         self.tokenizers = tokenizers or {}
@@ -106,7 +112,33 @@ class InferenceGateway:
             raise HTTPException(
                 exc.status_code, str(exc), headers={"Retry-After": "1"} if exc.status_code == 503 else None
             ) from exc
+        if self.role == "genrm" and path == "generate" and "messages" in payload and self.legacy_generate:
+            return JSONResponse(await self.legacy_generate(name, payload))
         self._ordinals[name] += 1
+        engine_id = (
+            next(
+                (
+                    entry.get("engine_id")
+                    for entry in snapshot["models"][name]["engines"]
+                    if (entry.get("base_url") or "").rstrip("/") == base_url and entry["state"] == "ready"
+                ),
+                None,
+            )
+            if self.start_request
+            else None
+        )
+        finish = self.start_request(name, base_url, engine_id) if self.start_request else lambda: None
+        response = None
+        try:
+            response = await self._forward_selected(request, path, payload, name, base_url, finish)
+            return response
+        finally:
+            if not isinstance(response, StreamingResponse):
+                finish()
+
+    async def _forward_selected(
+        self, request: Request, path: str, payload: dict, name: str, base_url: str, finish: Callable[[], None]
+    ) -> Response:
         payload.pop("route_key", None)
         # Internal model IDs need not be SGLang's checkpoint/served_model_name.
         payload.pop("model", None)
@@ -162,9 +194,17 @@ class InferenceGateway:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
             finally:
-                await upstream.aclose()
+                try:
+                    await upstream.aclose()
+                finally:
+                    finish()
 
-        return StreamingResponse(chunks(), status_code=upstream.status_code, media_type="text/event-stream")
+        return StreamingResponse(
+            chunks(),
+            status_code=upstream.status_code,
+            media_type="text/event-stream",
+            background=BackgroundTask(finish),
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -142,6 +142,9 @@ def _patch_ray(monkeypatch):
     monkeypatch.setattr(mem.ray, "get", fake_get)
     monkeypatch.setattr(mem.ray, "kill", fake_kill)
     monkeypatch.setattr(mem.ray.exceptions, "RayActorError", RuntimeError, raising=False)
+    monkeypatch.setattr(
+        sys.modules["ray.util.placement_group"], "placement_group_table", lambda pg: {"state": "REMOVED"}
+    )
 
     yield SimpleNamespace(created=created, killed=killed)
 

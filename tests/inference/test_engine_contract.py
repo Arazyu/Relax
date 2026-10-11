@@ -268,6 +268,7 @@ def test_genrm_memory_saver_disables_incompatible_default_prefill_graph(offload)
         _to_local_gpu_id=lambda gpu: gpu,
         _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS=[],
         ServerArgs=object,
+        _genrm_deterministic_attention_backend=lambda: None,
         logger=Mock(),
         dataclasses=SimpleNamespace(
             fields=lambda cls: [
