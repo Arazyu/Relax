@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from relax.engine.sft.runtime import is_offline_mode
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -37,10 +39,10 @@ def _actor():
         "relax/components/actor.py",
         "Actor",
         ("set_rollout_manager", "update_weights_fully_async"),
-        is_sft_mode=lambda config: config.sft,
+        is_offline_mode=is_offline_mode,
     )
     actor = cls()
-    actor.config = SimpleNamespace(fully_async=False, hybrid=False, sft=False)
+    actor.config = SimpleNamespace(fully_async=False, hybrid=False, loss_type="ppo")
     actor.actor_model = Mock()
     actor.rollout_manager = SimpleNamespace(set_policy_weights_ready=SimpleNamespace(remote=AsyncMock()))
     return actor
@@ -88,13 +90,15 @@ async def test_actor_startup_remains_responsive_and_waits_for_rpc(phase):
         actor.actor_model.update_weights.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    "fully_async,hybrid,sft,expected", [(True, False, False, 0), (True, True, False, 1), (False, False, True, 0)]
-)
-async def test_actor_startup_preserves_weight_sync_modes(fully_async, hybrid, sft, expected):
+@pytest.mark.parametrize("fully_async,hybrid", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("loss_type", ["ppo", "sft", "dpo", "rm"])
+async def test_actor_startup_preserves_weight_sync_modes(fully_async, hybrid, loss_type):
     actor = _actor()
-    actor.config = SimpleNamespace(fully_async=fully_async, hybrid=hybrid, sft=sft)
-    await actor.set_rollout_manager(object())
+    actor.config = SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type)
+    manager = object()
+    await actor.set_rollout_manager(manager)
+    actor.actor_model.set_rollout_manager.assert_called_once_with(manager)
+    expected = int(loss_type == "ppo" and (not fully_async or hybrid))
     assert actor.actor_model.update_weights.call_count == expected
 
 

@@ -1,11 +1,15 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import logging
 import math
+from collections import Counter
 from typing import Any, Literal
 
 import numpy as np
 import torch
 
 from relax.algorithms.spec import get_algorithm
+from relax.utils.repetition import detect_repetition
 from relax.utils.types import Sample
 
 
@@ -87,6 +91,51 @@ def compute_statistics(values: list[float]) -> dict[str, float]:
         "max": np.max(values).item(),
         "min": np.min(values).item(),
     }
+
+
+def compute_rollout_stop_reason_and_turn_metrics(
+    samples: list[Sample],
+) -> dict[str, int | float]:
+    """Aggregate rollout stop reasons and turn-count statistics."""
+    if not samples:
+        return {}
+
+    stop_reasons = []
+    turns = []
+
+    for sample in samples:
+        reason = sample.metadata.get("rollout_stop_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            reason = sample.metadata.get("stop_reason")
+            if isinstance(reason, str) and reason.strip():
+                reason = reason.strip().split(":", 1)[0]
+        if not isinstance(reason, str) or not reason.strip():
+            reason = "unknown"
+        else:
+            reason = reason.strip()
+
+        stop_reasons.append(reason)
+        turns.append(sample.metadata.get("rollout_turns", 1))
+
+    metrics: dict[str, int | float] = {}
+    num_samples = len(samples)
+
+    for reason, count in sorted(Counter(stop_reasons).items()):
+        prefix = f"stop_reason/{reason}/"
+        metrics[f"{prefix}count"] = count
+        metrics[f"{prefix}ratio"] = count / num_samples
+
+    metrics["num_turn/min"] = np.min(turns).item()
+    metrics["num_turn/mean"] = np.mean(turns).item()
+    metrics["num_turn/max"] = np.max(turns).item()
+
+    p50, p90, p95, p99 = np.percentile(turns, [50, 90, 95, 99])
+    metrics["num_turn/p50"] = p50.item()
+    metrics["num_turn/p90"] = p90.item()
+    metrics["num_turn/p95"] = p95.item()
+    metrics["num_turn/p99"] = p99.item()
+
+    return metrics
 
 
 def is_rollout_numeric_metric_value(value) -> bool:
@@ -277,11 +326,8 @@ def compression_ratio(
     return ratio, savings_pct
 
 
-def has_repetition(text: str):
-    if len(text) > 10000 and compression_ratio(text[-10000:])[0] > 10:
-        return True
-    else:
-        return False
+def has_repetition(text: str) -> bool:
+    return detect_repetition(text, stop_after_first_hit=True).has_repetition
 
 
 def compute_rollout_step(args, rollout_id):
