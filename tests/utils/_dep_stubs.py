@@ -192,8 +192,25 @@ def import_genrm_manager():
         exceptions.RayTaskError = type("RayTaskError", (Exception,), {})
         sys.modules["ray.exceptions"] = exceptions
         ray.exceptions = exceptions
-    _install("relax.backends.sglang.sglang_engine", SGLangEngine=type("SGLangEngine", (), {}))
-    return importlib.import_module("relax.distributed.ray.genrm")
+    # Only GenRM's import needs the bridge. Leaving it installed makes later
+    # engine tests mistake an empty class for an available SGLang runtime.
+    engine_name = "relax.backends.sglang.sglang_engine"
+    parent = importlib.import_module("relax.backends.sglang")
+    missing = object()
+    original_module = sys.modules.get(engine_name, missing)
+    original_attribute = getattr(parent, "sglang_engine", missing)
+    try:
+        _install(engine_name, SGLangEngine=type("SGLangEngine", (), {}))
+        return importlib.import_module("relax.distributed.ray.genrm")
+    finally:
+        if original_module is missing:
+            sys.modules.pop(engine_name, None)
+        else:
+            sys.modules[engine_name] = original_module
+        if original_attribute is missing:
+            delattr(parent, "sglang_engine")
+        else:
+            parent.sglang_engine = original_attribute
 
 
 def import_rollout_component():
