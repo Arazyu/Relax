@@ -15,6 +15,7 @@ Run: python -m unittest tests.components.test_genrm_scale_endpoints -v
 import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import ray
 
@@ -574,26 +575,28 @@ class TestWatcherCrashCapacity(unittest.TestCase):
         submit-time observation (review finding: missing != 0, and the freshest
         reading beats the oldest one)."""
 
-        class _FlakyProgressManager:
-            def __init__(self):
-                self.calls = 0
-
-            def get_scale_progress(self, _request_id):
-                self.calls += 1
-                if self.calls >= 3:
-                    raise RuntimeError("progress poll exploded")
-                return {"phase": "REMOVING", "current": 1, "ready": 1, "removed": 1, "physical_done": False}
-
-        flaky = _FlakyProgressManager()
         manager = _fake_manager()
-        manager.get_scale_progress = SimpleNamespace(remote=flaky.get_scale_progress)
         replica = _replica(manager)
         decision = replica._scale_registry.submit(
             "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
         )
         request_id = decision["request_id"]
-        with self.assertLogs("relax.components.genrm", level="ERROR"):
+        # RPC errors are caught by _manager_progress and do not crash the
+        # watcher. Inject at the watcher boundary to exercise its exception
+        # handler immediately, rather than waiting for the 60-second deadline.
+        progress = [
+            {"phase": "REMOVING", "current": 2, "ready": 1, "removed": 0, "physical_done": False},
+            {"phase": "REMOVING", "current": 1, "ready": 1, "removed": 1, "physical_done": False},
+            RuntimeError("progress processing exploded"),
+        ]
+        with (
+            patch.object(replica, "_manager_progress", side_effect=progress) as poll,
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+            self.assertLogs("relax.components.genrm", level="ERROR"),
+        ):
             _run(replica._watch_scale_operation("scale_in", "__default__", request_id))
+        self.assertEqual(poll.call_count, 3)
+        self.assertEqual(sleep.await_count, 2)
         status = replica._scale_registry.get_status("scale_in", request_id)
         self.assertEqual(status["status"], "FAILED")
         # Freshest observed counts (current=1 from the last good poll), not
@@ -603,6 +606,7 @@ class TestWatcherCrashCapacity(unittest.TestCase):
         self.assertEqual(status["removed"], 1)
         self.assertTrue(status["cleanup_required"])
         self.assertIn("watcher crashed", status["error_message"])
+        self.assertIn("progress processing exploded", status["error_message"])
 
 
 class TestRequestSamplingSeed(unittest.TestCase):
