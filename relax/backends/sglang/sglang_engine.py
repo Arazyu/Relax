@@ -1699,6 +1699,8 @@ def _compute_genrm_server_args(
     for attr in dataclasses.fields(ServerArgs):
         if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
             continue
+        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
+            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
         unused_keys.discard(attr.name)
 
     # Per-genrm overrides from --genrm-engine-config. Applied after base args

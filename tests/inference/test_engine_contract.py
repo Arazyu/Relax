@@ -4,6 +4,7 @@
 libraries."""
 
 import ast
+import dataclasses
 import multiprocessing
 import os
 import time
@@ -254,8 +255,10 @@ def test_group_pipeline_override_preserves_gpu_width_and_local_node_rank():
     assert kwargs["node_rank"] == 0
 
 
-@pytest.mark.parametrize("offload", [False, True])
-def test_genrm_memory_saver_disables_incompatible_default_prefill_graph(offload):
+@pytest.fixture
+def genrm_server_args():
+    """Execute the production builder with a supported schema, without GPU
+    imports."""
     path = Path(__file__).resolve().parents[2] / "relax/backends/sglang/sglang_engine.py"
     node = next(
         node
@@ -267,14 +270,33 @@ def test_genrm_memory_saver_disables_incompatible_default_prefill_graph(offload)
         is_s3_uri=lambda path: False,
         _to_local_gpu_id=lambda gpu: gpu,
         _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS=[],
-        ServerArgs=object,
+        ServerArgs=dataclasses.make_dataclass(
+            "ServerArgs",
+            [
+                (name, object)
+                for name in (
+                    "model_path",
+                    "random_seed",
+                    "tp_size",
+                    "pp_size",
+                    "moe_dense_tp_size",
+                    "enable_deterministic_inference",
+                    "enable_memory_saver",
+                    "enable_weights_cpu_backup",
+                    "enable_draft_weights_cpu_backup",
+                    "load_format",
+                    "attention_backend",
+                    "mem_fraction_static",
+                    "max_running_requests",
+                    "enable_hierarchical_cache",
+                    "enable_return_routed_experts",
+                    "cuda_graph_backend_prefill",
+                )
+            ],
+        ),
         _genrm_deterministic_attention_backend=lambda: None,
         logger=Mock(),
-        dataclasses=SimpleNamespace(
-            fields=lambda cls: [
-                SimpleNamespace(name=name) for name in ["enable_memory_saver", "cuda_graph_backend_prefill"]
-            ]
-        ),
+        dataclasses=dataclasses,
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     args = SimpleNamespace(
@@ -283,8 +305,81 @@ def test_genrm_memory_saver_disables_incompatible_default_prefill_graph(offload)
         genrm_model_path="checkpoint",
         genrm_engine_config={},
         seed=1,
-        offload_rollout=offload,
+        offload_rollout=False,
         fp16=False,
     )
-    kwargs, _ = namespace["_compute_genrm_server_args"](args, 0, "node:10000", 10001, "node", 10002, base_gpu_id=0)
+    return namespace["_compute_genrm_server_args"], args
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_genrm_memory_saver_disables_incompatible_default_prefill_graph(genrm_server_args, offload):
+    compute, args = genrm_server_args
+    args.offload_rollout = offload
+    kwargs, _ = compute(args, 0, "node:10000", 10001, "node", 10002, base_gpu_id=0)
     assert kwargs.get("cuda_graph_backend_prefill") == ("disabled" if offload else None)
+
+
+@pytest.mark.parametrize(
+    ("global_backend", "probe_backend", "override", "expected"),
+    [
+        (None, "fa3", None, "fa3"),
+        ("triton", "fa3", None, "triton"),
+        ("flashinfer", None, None, "flashinfer"),
+        (None, None, None, None),
+        ("triton", "fa3", "flashinfer", "flashinfer"),
+        (None, "fa3", "triton", "triton"),
+    ],
+)
+def test_genrm_attention_backend_precedence_without_sglang(
+    genrm_server_args, monkeypatch, global_backend, probe_backend, override, expected
+):
+    compute, args = genrm_server_args
+    if global_backend is not None:
+        args.sglang_attention_backend = global_backend
+    if override is not None:
+        args.genrm_engine_config["attention_backend"] = override
+    monkeypatch.setitem(compute.__globals__, "_genrm_deterministic_attention_backend", lambda: probe_backend)
+    kwargs, _ = compute(args, 0, "node:10000", 10001, "node", 10002, base_gpu_id=0)
+    if expected is None:
+        assert "attention_backend" not in kwargs
+    else:
+        assert kwargs["attention_backend"] == expected
+    assert kwargs["enable_deterministic_inference"] is True
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_genrm_inherits_global_tuning_without_overwriting_role_defaults(genrm_server_args, override):
+    compute, args = genrm_server_args
+    args.sglang_mem_fraction_static = 0.4
+    args.sglang_max_running_requests = 7
+    args.sglang_load_format = "dummy"
+    args.sglang_model_path = "policy-checkpoint"
+    args.sglang_random_seed = 999
+    args.sglang_tp_size = 8
+    args.sglang_pp_size = 2
+    args.sglang_moe_dense_tp_size = 1
+    args.sglang_enable_weights_cpu_backup = False
+    args.sglang_enable_draft_weights_cpu_backup = True
+    args.use_rollout_routing_replay = True
+    if override:
+        args.genrm_engine_config.update(mem_fraction_static=0.2, max_running_requests=3)
+    kwargs, _ = compute(args, 0, "node:10000", 10001, "node", 10002, base_gpu_id=0)
+    assert kwargs["mem_fraction_static"] == (0.2 if override else 0.4)
+    assert kwargs["max_running_requests"] == (3 if override else 7)
+    assert kwargs["load_format"] == "auto"
+    assert kwargs["model_path"] == "checkpoint"
+    assert kwargs["random_seed"] == 1
+    assert kwargs["tp_size"] == 2
+    assert kwargs["pp_size"] == 1
+    assert kwargs["moe_dense_tp_size"] is None
+    assert kwargs["enable_weights_cpu_backup"] is True
+    assert kwargs["enable_draft_weights_cpu_backup"] is False
+    assert "enable_return_routed_experts" not in kwargs
+
+
+@pytest.mark.parametrize("worker_type", ["regular", "decode"])
+def test_genrm_decode_does_not_inherit_hierarchical_cache(genrm_server_args, worker_type):
+    compute, args = genrm_server_args
+    args.sglang_enable_hierarchical_cache = True
+    kwargs, _ = compute(args, 0, "node:10000", 10001, "node", 10002, worker_type=worker_type, base_gpu_id=0)
+    assert kwargs.get("enable_hierarchical_cache", False) is (worker_type == "regular")
