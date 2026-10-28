@@ -6,6 +6,8 @@ backends."""
 import ast
 import asyncio
 import importlib.util
+import multiprocessing
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,7 +29,8 @@ def methods(*names):
     body = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"_read_local_actor_state", "_read_engine_metadata"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_read_local_actor_state", "_read_engine_metadata", "stop_launched_routers"}
     ] + [
         node
         for node in original.body
@@ -43,9 +46,45 @@ def methods(*names):
         engine_record=engine_record,
         EngineGroupLifecycle=SimpleNamespace(ACTIVE="active"),
         _wrap_ipv6=lambda value: value,
+        multiprocessing=multiprocessing,
+        time=time,
     )
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), str(path), "exec"), namespace)
     return namespace
+
+
+@pytest.mark.parametrize("failure", ["terminate", "kill", "still_alive"])
+def test_dispose_retries_unconfirmed_router_cleanup(failure):
+    namespace = methods("dispose", "_dispose")
+    process = Mock(pid=123)
+    process.is_alive.return_value = True
+    if failure != "still_alive":
+        getattr(process, failure).side_effect = OSError("cleanup failed")
+    detach = Mock()
+    namespace.update(_LAUNCHED_ROUTER_PROCESSES=[process], detach_tq_client=detach)
+    owner = SimpleNamespace(
+        inference=InferenceManager("rollout"),
+        _stop_eviction_monitor=Mock(),
+        _health_monitors=[],
+        _shutdown_all_engines=Mock(),
+        data_system_client=object(),
+    )
+    owner._dispose = lambda: namespace["_dispose"](owner)
+
+    with pytest.raises(RuntimeError, match="Router cleanup incomplete"):
+        namespace["dispose"](owner)
+    assert owner.inference.state == "failed"
+    assert namespace["_LAUNCHED_ROUTER_PROCESSES"] == [process]
+    assert owner.data_system_client is None
+
+    process.terminate.side_effect = lambda: setattr(process.is_alive, "return_value", False)
+    namespace["dispose"](owner)
+    assert owner.inference.state == "dead"
+    assert namespace["_LAUNCHED_ROUTER_PROCESSES"] == []
+    namespace["dispose"](owner)
+    assert process.terminate.call_count == 2
+    assert owner._shutdown_all_engines.call_count == 2
+    detach.assert_called_once_with()
 
 
 def test_discovery_hides_followers_and_waits_for_actual_weight_commit():

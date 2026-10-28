@@ -217,7 +217,8 @@ def test_failed_pause_never_releases_gpu_memory(monkeypatch):
     assert not engine._memory_released
 
 
-def test_group_pipeline_override_preserves_gpu_width_and_local_node_rank():
+@pytest.fixture
+def compute_server_args():
     path = Path(__file__).resolve().parents[2] / "relax/backends/sglang/sglang_engine.py"
     node = next(
         node
@@ -232,13 +233,25 @@ def test_group_pipeline_override_preserves_gpu_width_and_local_node_rank():
         _enable_draft_weights_cpu_backup=lambda *args: False,
         _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS=[],
         ServerArgs=object,
-        _server_arg_field_names=lambda: ("tp_size", "pp_size", "node_rank"),
+        _server_arg_field_names=lambda: (
+            "tp_size",
+            "pp_size",
+            "dp_size",
+            "node_rank",
+            "enable_dp_attention",
+            "enable_return_indexer_topk",
+            "enable_return_routed_experts",
+        ),
         logger=Mock(),
         dataclasses=SimpleNamespace(
             fields=lambda cls: [SimpleNamespace(name=name) for name in ["tp_size", "pp_size", "node_rank"]]
         ),
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_compute_server_args"]
+
+
+def test_group_pipeline_override_preserves_gpu_width_and_local_node_rank(compute_server_args):
     args = SimpleNamespace(
         num_gpus_per_node=2,
         rollout_num_gpus_per_engine=4,
@@ -251,11 +264,58 @@ def test_group_pipeline_override_preserves_gpu_width_and_local_node_rank():
         use_rollout_routing_replay=False,
         fp16=False,
     )
-    kwargs, _ = namespace["_compute_server_args"](
+    kwargs, _ = compute_server_args(
         args, 1, "node:10000", 10001, "node", 10002, base_gpu_id=0, sglang_overrides={"pp_size": 2, "node_rank": 0}
     )
     assert kwargs["tp_size"] * kwargs["pp_size"] == 4
     assert kwargs["node_rank"] == 0
+
+
+@pytest.mark.parametrize("teacher_capture", [None, False, True])
+def test_teacher_does_not_inherit_student_indexer_replay(compute_server_args, teacher_capture):
+    from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_overrides
+
+    args = SimpleNamespace(
+        teacher_hf_checkpoint="teacher-checkpoint",
+        num_gpus_per_node=2,
+        rollout_num_gpus_per_engine=2,
+        hf_checkpoint="student-checkpoint",
+        seed=1,
+        offload_rollout=False,
+        fp16=False,
+        sglang_pp_size=1,
+        sglang_dp_size=2,
+        sglang_ep_size=1,
+        sglang_enable_dp_attention=True,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=True,
+    )
+    if teacher_capture is not None:
+        args.teacher_sglang_enable_return_indexer_topk = teacher_capture
+        args.teacher_sglang_enable_dp_attention = True
+        args.teacher_sglang_dp_size = 2
+    overrides = build_teacher_overrides(args)
+    teacher = build_teacher_engine_args(args, overrides)
+    kwargs, _ = compute_server_args(
+        teacher,
+        0,
+        "node:10000",
+        10001,
+        "node",
+        10002,
+        base_gpu_id=0,
+        sglang_overrides=overrides,
+        num_gpus_per_engine=2,
+    )
+    assert kwargs["tp_size"] == 2
+    assert kwargs["dp_size"] == (1 if teacher_capture is None else 2)
+    assert kwargs.get("enable_dp_attention", False) is (teacher_capture is not None)
+    assert kwargs.get("enable_return_indexer_topk", False) is bool(teacher_capture)
+    assert not kwargs.get("enable_return_routed_experts", False)
+    assert teacher.use_rollout_indexer_replay is False
+    assert args.use_rollout_indexer_replay is True
+    assert args.use_rollout_routing_replay is True
+    assert args.sglang_dp_size == 2
 
 
 @pytest.fixture

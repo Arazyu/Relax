@@ -161,6 +161,7 @@ def build_teacher_engine_args(args: Any, overrides: dict[str, object]) -> Any:
     teacher_args.sglang_router_ip = None
     teacher_args.sglang_router_port = None
     teacher_args.use_rollout_routing_replay = False
+    teacher_args.use_rollout_indexer_replay = False
     teacher_args.enable_mtp_training = False
     teacher_args.lora_adapter_mode = False
     for key, value in overrides.items():

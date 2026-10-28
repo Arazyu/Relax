@@ -1089,6 +1089,8 @@ class RolloutManager(ReloadableMixin):
                 # Routers are child processes of this Ray actor, so its process
                 # owns the registry; the Controller driver's registry is separate.
                 stop_launched_routers()
+                if _LAUNCHED_ROUTER_PROCESSES:
+                    raise RuntimeError("Router cleanup incomplete; retry shutdown")
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
