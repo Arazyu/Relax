@@ -1304,7 +1304,7 @@ class Controller:
                 ray.kill(manager)
             except Exception:
                 logger.exception("Cannot kill static inference manager")
-        if getattr(self.config, "opd_teacher_gateway_url", None):
+        if getattr(getattr(self, "config", None), "opd_teacher_gateway_url", None):
             try:
                 serve.delete("teacher")
             except Exception:
