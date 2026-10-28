@@ -18,6 +18,7 @@ from relax.engine.sft.eval.preference import (
     preference_eval_chunk_sizes,
     preference_eval_local_batch_sizes,
 )
+from relax.engine.sft.runtime import is_dpo_mode
 
 
 @pytest.mark.parametrize(
@@ -136,16 +137,19 @@ def test_dpo_eval_scores_only_completion_tokens(
 
     logged = {}
     namespace = {
+        "is_dpo_mode": is_dpo_mode,
         "torch": torch,
         "time": time,
         "mpu": SimpleNamespace(
             get_data_parallel_world_size=lambda **_: dp_size,
+            get_pipeline_model_parallel_world_size=lambda: 1,
             get_pipeline_model_parallel_group=lambda: "pp",
             get_data_parallel_group=lambda **_: "dp",
         ),
         "dist": SimpleNamespace(
             barrier=lambda **_: None,
             get_rank=lambda: 0,
+            get_world_size=lambda group: dp_size,
             all_reduce=all_reduce,
             ReduceOp=SimpleNamespace(SUM=None),
         ),

@@ -8,6 +8,8 @@ import asyncio
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -24,6 +26,10 @@ def methods(*names):
     original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RolloutManager")
     body = [
         node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_read_local_actor_state", "_read_engine_metadata"}
+    ] + [
+        node
         for node in original.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
     ]
@@ -31,6 +37,9 @@ def methods(*names):
         node.decorator_list = []
     namespace = dict(
         ray=SimpleNamespace(get=lambda value, **kwargs: value),
+        Any=Any,
+        _EngineInitRecord=SimpleNamespace,
+        logger=Mock(),
         engine_record=engine_record,
         EngineGroupLifecycle=SimpleNamespace(ACTIVE="active"),
         _wrap_ipv6=lambda value: value,
@@ -42,7 +51,13 @@ def methods(*names):
 def test_discovery_hides_followers_and_waits_for_actual_weight_commit():
     group = SimpleNamespace(
         worker_type="regular",
-        all_engines=[SimpleNamespace(get_url=SimpleNamespace(remote=lambda: "http://head")), object()],
+        all_engines=[SimpleNamespace(_get_local_state=lambda: "ALIVE") for _ in range(2)],
+        engine_init_records={
+            rank: SimpleNamespace(
+                value={"url": "http://head" if rank == 0 else None, "pid": 100 + rank, "node_id": f"node{rank}"}
+            )
+            for rank in range(2)
+        },
         nodes_per_engine=2,
         lifecycle_status="active",
         rank_offset=0,
@@ -50,7 +65,12 @@ def test_discovery_hides_followers_and_waits_for_actual_weight_commit():
     )
     server = SimpleNamespace(engine_groups=[group], router_ip="router", router_port=8000)
     owner = InferenceManager("rollout", {"default": server})
-    manager = SimpleNamespace(inference=owner, _is_weight_updating=False, _policy_weights_ready={"default": False})
+    manager = SimpleNamespace(
+        inference=owner,
+        _is_weight_updating=False,
+        _policy_weights_ready={"default": False},
+        _engine_actor_states=SimpleNamespace(Name=lambda state: state),
+    )
     snapshot = methods("get_inference_snapshot")["get_inference_snapshot"]
     info = snapshot(manager)["models"]["default"]
     assert len(info["engines"]) == 1
@@ -60,8 +80,26 @@ def test_discovery_hides_followers_and_waits_for_actual_weight_commit():
     assert snapshot(manager)["models"]["default"]["state"] != "ready"
     manager._policy_weights_ready["default"] = True
     assert snapshot(manager)["models"]["default"]["state"] == "ready"
+    group.all_engines[1]._get_local_state = lambda: "DEAD"
+    assert snapshot(manager)["models"]["default"]["state"] != "ready"
+    group.all_engines[1]._get_local_state = lambda: "ALIVE"
+    group.engine_init_records[0].pending_router_registration = True
+    assert snapshot(manager)["models"]["default"]["state"] != "ready"
+    group.engine_init_records[0].pending_router_registration = False
+    assert snapshot(manager)["models"]["default"]["state"] == "ready"
     manager._is_weight_updating = True
     assert snapshot(manager)["models"]["default"]["state"] != "ready"
+
+    manager._is_weight_updating = False
+
+    def retire_head_while_reading_follower():
+        group.all_engines[0] = None
+        return "ALIVE"
+
+    group.all_engines[1]._get_local_state = retire_head_while_reading_follower
+    info = snapshot(manager)["models"]["default"]
+    assert info["state"] != "ready"
+    assert not info["engines"][0]["direct_eligible"]
 
 
 async def test_deferred_eval_cannot_offload_during_training_generation():

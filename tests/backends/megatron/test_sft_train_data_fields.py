@@ -102,7 +102,7 @@ def test_sequence_classification_sft_requests_classification_labels():
 
 
 def test_rl_data_fields_include_replay_metadata():
-    """RL training exposes sample identity and reward metadata for replay."""
+    """RL training exposes sample and group identity for replay."""
     from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="policy_loss")
@@ -115,10 +115,22 @@ def test_rl_data_fields_include_replay_metadata():
         "rewards",
         "sample_indices",
         "sample_index_mask_sums",
-        "raw_reward",
         "group_index",
     ):
         assert required in fields
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "score_centering"])
+def test_score_centering_requests_rollout_head_fields(algorithm):
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="policy_loss")
+    args.advantage_estimator = algorithm
+
+    fields = build_data_fields(args)
+
+    for field in ("rollout_topk_token_ids", "rollout_topk_log_probs"):
+        assert (field in fields) == (algorithm == "score_centering")
 
 
 def test_sft_partition_naming_uses_sft_prefix():
@@ -133,3 +145,20 @@ def test_sft_partition_naming_uses_sft_prefix():
     rl_args = _mk_actor_args(loss_type="policy_loss")
     assert sft_partition_id(rl_args, 7) == "train_7"
     assert sft_task_name(rl_args, component="backend") == "train"
+
+
+def test_image_preprocess_on_rank_requests_descriptor_field():
+    """--sft-image-preprocess-on-rank swaps the pixel payload for image refs."""
+    from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="sft")
+    args.multimodal_keys = {"image": "images"}
+
+    assert SFT_IMAGE_REFS_FIELD not in build_data_fields(args)
+
+    args.sft_image_preprocess_on_rank = True
+    fields = build_data_fields(args)
+
+    assert SFT_IMAGE_REFS_FIELD in fields
+    assert "multimodal_train_inputs" in fields  # the producer grid stays

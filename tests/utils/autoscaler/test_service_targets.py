@@ -679,7 +679,7 @@ class TestPatchConfig(unittest.TestCase):
         svc._services["genrm"].state.last_scale_time = 200.0
 
         async def _fake_fetch(service="rollout"):
-            return []
+            return [], {"complete": True, "issues": []}
 
         svc._fetch_engines = _fake_fetch
         status = asyncio.run(svc.get_autoscaler_status())

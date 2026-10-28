@@ -22,11 +22,12 @@ class Config:
 
 # ---------------------------------------------------------------------------
 # GPU peak FLOPS tests
+# Device-name inputs are synthetic fixtures, not measured hardware.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "device_name, expected_raw_flops",
     [
-        ("NVIDIA H100 80GB HBM3", 989e12),
+        ("NVIDIA H100 80GB HBM3", 989e12),  # gitleaks:allow
         ("NVIDIA H800", 989e12),
         ("NVIDIA A100-SXM4-80GB", 312e12),
         ("NVIDIA A800-SXM4-80GB", 312e12),
@@ -63,13 +64,13 @@ def test_get_device_peak_flops_defaults_to_cpu_when_device_properties_unavailabl
 
 
 def test_get_device_peak_flops_unit_conversion():
-    tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100")
-    gflops = get_device_peak_flops(unit="G", device_name="NVIDIA H100")
+    tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100")  # gitleaks:allow
+    gflops = get_device_peak_flops(unit="G", device_name="NVIDIA H100")  # gitleaks:allow
     assert math.isclose(tflops * 1000, gflops, rel_tol=1e-6)
 
 
 def test_device_flops_table_has_common_gpus():
-    common_keys = ["H100", "H800", "A100", "A800", "H20"]
+    common_keys = ["H100", "H800", "A100", "A800", "H20"]  # gitleaks:allow
     for key in common_keys:
         assert key in _DEVICE_FLOPS, f"Missing common GPU {key} in _DEVICE_FLOPS"
 
@@ -134,6 +135,38 @@ FLOPS_TEST_CONFIGS = {
 
 
 FLOPS_TEST_VL_CONFIGS = {
+    "qwen3_vl": {
+        # Exact config of Qwen/Qwen3-VL-4B-Instruct. Note head_dim=128 is set
+        # explicitly and num_attention_heads * head_dim (32 * 128 = 4096) !=
+        # hidden_size (2560), so head_dim must be read from the config.
+        "config": {
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 2560,
+                "vocab_size": 151936,
+                "num_hidden_layers": 36,
+                "num_key_value_heads": 8,
+                "num_attention_heads": 32,
+                "head_dim": 128,
+                "intermediate_size": 9728,
+            },
+            "vision_config": {
+                "num_heads": 16,
+                "depth": 24,
+                "hidden_size": 1024,
+                "intermediate_size": 4096,
+                "out_hidden_size": 2560,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "in_channels": 3,
+                "patch_size": 16,
+                "deepstack_visual_indexes": [5, 11, 17],
+            },
+        },
+        "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
+        "images_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
+        "expected_tflops_list": [110225906466816 / 1e12, 415025911037952 / 1e12],
+    },
     "qwen3_5": {
         "config": {
             "model_type": "qwen3_5",
@@ -306,7 +339,7 @@ def test_flops_counter_omni_estimation(config_name):
 
 
 def test_mfu_calculation():
-    peak_tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100 80GB HBM3")
+    peak_tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100 80GB HBM3")  # gitleaks:allow
     achieved_tflops = 200.0
     mfu = achieved_tflops / peak_tflops
     assert 0 < mfu < 1

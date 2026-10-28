@@ -109,7 +109,7 @@ async def run_deferred_batch(
 
                 eval_args = copy.copy(args)
                 eval_args.rewards_normalization = False
-                raw, _ = await asyncio.to_thread(post_process_rewards, eval_args, samples)
+                raw = await asyncio.to_thread(post_process_rewards, eval_args, samples)
                 for sample, reward in zip(samples, raw, strict=True):
                     key = getattr(args, "eval_reward_key", None) or getattr(args, "reward_key", None)
                     if key:
@@ -118,9 +118,9 @@ async def run_deferred_batch(
                     else:
                         sample.reward = reward
             return
-        raw, processed = await asyncio.to_thread(post_process_rewards, args, samples)
-        for sample, raw_reward, processed_reward in zip(samples, raw, processed, strict=True):
-            sample._inference_reward_result = (raw_reward, processed_reward)
+        processed = await asyncio.to_thread(post_process_rewards, args, samples)
+        for sample, processed_reward in zip(samples, processed, strict=True):
+            sample._inference_reward_result = processed_reward
 
     if getattr(args, "defer_reward_to_post_process", False):
         if not judges:

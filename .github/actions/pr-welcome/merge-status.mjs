@@ -15,8 +15,13 @@ const checkQuery = `query($owner: String!, $repo: String!, $number: Int!, $ref: 
     object(expression: $ref) { ... on Commit {
       statusCheckRollup { contexts(first: 100, after: $cursor) {
         nodes {
-          ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) }
-          ... on StatusContext { context state isRequired(pullRequestNumber: $number) }
+          __typename
+          ... on CheckRun {
+            databaseId name status conclusion
+            checkSuite { app { databaseId } workflowRun { event workflow { id name } } }
+            isRequired(pullRequestNumber: $number)
+          }
+          ... on StatusContext { context state createdAt isRequired(pullRequestNumber: $number) }
         }
         pageInfo { hasNextPage endCursor }
       } }
@@ -97,7 +102,7 @@ export async function loadMergeStatus({ github, repo, number }) {
         { ...variables, ref },
         (data) => data.repository.object.statusCheckRollup?.contexts
       )
-      return nodes.filter((check) => check.isRequired)
+      return nodes
     })
   )
 
@@ -132,14 +137,64 @@ export async function loadMergeStatus({ github, repo, number }) {
   return { pr, state, rules, reviews, checks, teams, warnings }
 }
 
+function currentChecks(checks) {
+  const groups = new Map()
+  for (const check of checks) {
+    const suite = check.checkSuite
+    // Like gh pr checks, keep statuses and distinct workflows/events separate.
+    // Include the app too: another provider must not supersede a required result.
+    const key = JSON.stringify(
+      check.__typename === 'StatusContext'
+        ? ['StatusContext', check.context]
+        : [
+            'CheckRun',
+            check.name,
+            suite?.app?.databaseId,
+            suite?.workflowRun?.workflow?.id || suite?.workflowRun?.workflow?.name,
+            suite?.workflowRun?.event,
+          ]
+    )
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(check)
+  }
+  return [...groups.values()].flatMap((group) => {
+    // Check IDs are a creation-order proxy, not GitHub's merge verdict. Unlike
+    // gh's startedAt sort, this also handles new queued reruns with no start time
+    // and old jobs that start/finish later. Never prefer a successful conclusion.
+    const order = (check) =>
+      check.__typename === 'StatusContext' ? Date.parse(check.createdAt) : check.databaseId
+    // Missing ordering/provider metadata and exact ties remain conservative;
+    // do not guess which potentially blocking report was superseded.
+    if (
+      group.some(
+        (check) =>
+          !order(check) || (check.__typename === 'CheckRun' && !check.checkSuite?.app?.databaseId)
+      )
+    )
+      return group
+    const latest = Math.max(...group.map(order))
+    return group.filter((check) => order(check) === latest)
+  })
+}
+
 function ciStatus(required, checks) {
-  const results = required.flatMap(({ context }) => {
-    // Prefer the test merge commit when it reports this required context.
-    const source =
-      checks
-        .toReversed()
-        .find((checks) => checks.some((check) => (check.name || check.context) === context)) || []
-    const reported = source.filter((check) => (check.name || check.context) === context)
+  const sources = checks.map((checks) => currentChecks(checks).filter((check) => check.isRequired))
+  const results = required.flatMap(({ context, integration_id }) => {
+    const providers = new Set(
+      required
+        .filter((check) => check.context === context && check.integration_id > 0)
+        .map((check) => check.integration_id)
+    )
+    const matches = (check) =>
+      (check.name || check.context) === context &&
+      // A legacy status has no app ID. isRequired is authoritative unless the
+      // same name is pinned to multiple providers, which cannot be disambiguated.
+      (check.__typename === 'StatusContext'
+        ? !(integration_id > 0) || providers.size <= 1
+        : !(integration_id > 0) || check.checkSuite?.app?.databaseId === integration_id)
+    // Prefer the test merge commit when it reports this required context/provider.
+    const source = sources.toReversed().find((checks) => checks.some(matches)) || []
+    const reported = source.filter(matches)
     return reported.length
       ? reported.map(
           (check) => check.state || (check.status === 'COMPLETED' ? check.conclusion : 'PENDING')

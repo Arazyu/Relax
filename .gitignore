@@ -78,3 +78,6 @@ demos/task4_genrm/results/reward_consistency_20260925_v1_seed_instability/
 # color-code-abutted "rollout N:" lines (fixed in the driver)
 demos/task4_genrm/results/train_continuity_20260925_r2/
 demos/task4_genrm/results/train_continuity_20260925_r3_tail_regex_defect/
+
+# Machine-local multimodal acceptance artifacts (hundreds of MB, never commit)
+tests/fixtures/

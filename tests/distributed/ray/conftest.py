@@ -24,6 +24,7 @@ try:
     from relax.distributed.ray.rollout import (
         EngineGroup,
         RolloutServer,
+        _get_engine_actor_states,
     )
 
     # Extract the original Python class from the Ray actor wrapper so we can
@@ -227,6 +228,7 @@ def create_test_manager(args=None, servers=None):
 
     manager = object.__new__(_OriginalRM)
     manager.args = args
+    manager._engine_actor_states = _get_engine_actor_states()
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
     manager._scale_in_requests = {}

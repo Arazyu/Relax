@@ -56,6 +56,7 @@ def engine_contract():
     engine = namespace["Engine"]()
     engine.role = "teacher"
     engine.node_rank = 0
+    engine.worker_type = "regular"
     engine.server_host, engine.server_port = "host", 8000
     engine._loaded_memory_tags = {"weights", "kv_cache", "cuda_graph"}
     engine._generation_paused = False
@@ -102,8 +103,9 @@ def test_startup_failure_retains_process_until_confirmed_cleanup(monkeypatch, ki
     namespace = engine._init_normal.__globals__
     namespace.update(
         multiprocessing=multiprocessing,
+        os=os,
         Callable=Callable,
-        ServerArgs=lambda **kwargs: SimpleNamespace(**kwargs, url=lambda: "http://host:8000"),
+        ServerArgs=lambda **kwargs: SimpleNamespace(**kwargs, dp_size=1, url=lambda: "http://host:8000"),
         Envs=SimpleNamespace(
             RELAX_OPTIMIZE_ROUTING_REPLAY=False, RELAX_OPD_PREEXPANDED_PATCH=False, RELAX_OPD_PER_POS_TOKEN_IDS=False
         ),
@@ -230,6 +232,7 @@ def test_group_pipeline_override_preserves_gpu_width_and_local_node_rank():
         _enable_draft_weights_cpu_backup=lambda *args: False,
         _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS=[],
         ServerArgs=object,
+        _server_arg_field_names=lambda: ("tp_size", "pp_size", "node_rank"),
         logger=Mock(),
         dataclasses=SimpleNamespace(
             fields=lambda cls: [SimpleNamespace(name=name) for name in ["tp_size", "pp_size", "node_rank"]]
@@ -297,6 +300,9 @@ def genrm_server_args():
         _genrm_deterministic_attention_backend=lambda: None,
         logger=Mock(),
         dataclasses=dataclasses,
+    )
+    namespace["_server_arg_field_names"] = lambda: tuple(
+        field.name for field in dataclasses.fields(namespace["ServerArgs"])
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     args = SimpleNamespace(

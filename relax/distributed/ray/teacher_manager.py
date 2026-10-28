@@ -4,8 +4,8 @@
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.core.service import create_placement_group
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+from relax.distributed.ray.placement_group import create_placement_group
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -35,12 +35,9 @@ def _resolve_teacher_gpu_index(
 
 def _build_teacher_engine_env(args) -> dict[str, str]:
     env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
-        # OPD patches default off; enabled only when the corresponding env flag is
-        # passed through from the driver. RELAX_OPD_PREEXPANDED_PATCH affects the
-        # teacher engine only; RELAX_OPD_PER_POS_TOKEN_IDS affects teacher + student.
-        "RELAX_OPD_PREEXPANDED_PATCH": str(int(Envs.RELAX_OPD_PREEXPANDED_PATCH)),
+        # Native multimodal OPD must preserve the supplied response token IDs.
+        "SGLANG_MM_AVOID_RETOKENIZE": "true",
         "RELAX_OPD_PER_POS_TOKEN_IDS": str(int(Envs.RELAX_OPD_PER_POS_TOKEN_IDS)),
-        "RELAX_OPD_TOKEN_IDS_LOGPROB_K": Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
         "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
@@ -70,6 +67,12 @@ class TeacherManager(MultiEngineManager):
     ) -> None:
         assert num_replicas >= 1, f"num_replicas must be >= 1, got {num_replicas}."
         assert gpus_per_replica > 0, f"gpus_per_replica must be > 0, got {gpus_per_replica}."
+        if gpus_per_replica > args.num_gpus_per_node:
+            assert gpus_per_replica % args.num_gpus_per_node == 0, (
+                f"Multi-node teacher GPUs ({gpus_per_replica}) must be divisible by "
+                f"num_gpus_per_node ({args.num_gpus_per_node})."
+            )
+        nodes_per_engine = max(1, gpus_per_replica // args.num_gpus_per_node)
         if shared_pg:
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
@@ -97,7 +100,7 @@ class TeacherManager(MultiEngineManager):
         self._teacher_args = build_teacher_engine_args(args, overrides)
         logger.info(
             f"[OPD teacher] launching {num_replicas} replica(s), "
-            f"TP={gpus_per_replica}, model={overrides['model_path']}, "
+            f"TP={gpus_per_replica}, nodes_per_engine={nodes_per_engine}, model={overrides['model_path']}, "
             f"shared_pg={shared_pg}, mem_fraction_static={overrides.get('mem_fraction_static')}"
         )
 

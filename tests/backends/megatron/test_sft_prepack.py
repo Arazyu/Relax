@@ -108,6 +108,7 @@ def test_sft_train_prefetch_pauses_at_step_boundary(monkeypatch):
     actor.args = Namespace(num_rollout=10)
     actor._sft_train_prefetch_executor = MagicMock()
     actor._sft_train_prefetch = None
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = None
     monkeypatch.setattr(actor_module, "_should_pause_sft_lookahead", lambda *_args: True)
 
@@ -122,6 +123,7 @@ def test_sft_train_prefetch_matching_failure_falls_back_and_clears_slot(monkeypa
     actor._sft_train_prefetch_executor = MagicMock()
     actor._sft_train_prefetch = MagicMock()
     actor._sft_train_prefetch.result.side_effect = RuntimeError("fetch failed")
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = 4
 
     assert actor._take_sft_train_prefetch(4) is None
@@ -136,6 +138,7 @@ def test_sft_train_prefetch_running_stale_future_fails_fast(monkeypatch):
     actor._sft_train_prefetch = MagicMock()
     actor._sft_train_prefetch.done.return_value = False
     actor._sft_train_prefetch.cancel.return_value = False
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = 3
 
     with pytest.raises(RuntimeError, match="Cannot cancel stale"):
@@ -147,6 +150,7 @@ def test_sft_train_prefetch_shutdown_is_idempotent():
     future = MagicMock()
     executor = MagicMock()
     actor._sft_train_prefetch = future
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = 3
     actor._sft_train_prefetch_executor = executor
 
@@ -211,3 +215,55 @@ def test_sft_prepack_fetch_waits_until_all_tq_shards_are_ready(monkeypatch):
 
     assert actor._fetch_sft_prepack_rollout_once("sft_train", rollout_id=3, data_fields=["tokens"]) is None
     fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("rollout_data,resolved", [(None, False), ({"tokens": [[1]]}, True)])
+def test_sft_actor_routes_empty_and_ready_fetches_through_rank_image_resolution(monkeypatch, rollout_data, resolved):
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_rank", lambda **_kwargs: 0)
+    monkeypatch.setattr(actor_module.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        actor_module,
+        "get_data_from_transfer_queue",
+        lambda *_args, **_kwargs: (rollout_data, {"meta": 1}),
+    )
+
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = Namespace(per_rank_fetch=True, use_rollout_indexer_replay=False)
+    actor.data_system_client = MagicMock()
+    actor.model = MagicMock()
+    actor._sft_image_preprocess_on_rank = True
+    actor._sft_image_prefetch = MagicMock()
+    actor._sft_image_prefetch.resolve_across_ranks.return_value = resolved
+
+    result, meta = actor._get_data_from_transfer_queue(
+        "sft_train", 3, ["tokens", "multimodal_image_refs"], 1, 0, partition_id="sft_3"
+    )
+
+    assert result is rollout_data
+    assert meta == {"meta": 1}
+    actor._sft_image_prefetch.resolve_across_ranks.assert_called_once_with(
+        rollout_data, 3, model=actor.model, log=True
+    )
+
+
+def test_sft_actor_surfaces_rank_image_resolution_failure(monkeypatch):
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_rank", lambda **_kwargs: 0)
+    monkeypatch.setattr(actor_module.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        actor_module,
+        "get_data_from_transfer_queue",
+        lambda *_args, **_kwargs: ({"tokens": [[1]]}, None),
+    )
+
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = Namespace(per_rank_fetch=True, use_rollout_indexer_replay=False)
+    actor.data_system_client = MagicMock()
+    actor.model = MagicMock()
+    actor._sft_image_preprocess_on_rank = True
+    actor._sft_image_prefetch = MagicMock()
+    actor._sft_image_prefetch.resolve_across_ranks.side_effect = RuntimeError("peer image resolution failed")
+
+    with pytest.raises(RuntimeError, match="peer image resolution failed"):
+        actor._get_data_from_transfer_queue(
+            "sft_train", 3, ["tokens", "multimodal_image_refs"], 1, 0, partition_id="sft_3"
+        )

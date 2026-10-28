@@ -16,18 +16,18 @@ from tests.utils.test_arguments_opd_teacher_colocate import (
 arguments_module = _arguments_module_fixture
 
 
-def test_sft_async_prepack_rejects_single_in_flight_step(arguments_module):
+def test_sft_legacy_prepack_allows_single_in_flight_step(arguments_module):
     args = SimpleNamespace(sft_max_in_flight_steps=1, sft_async_prepack=True, max_staleness=0)
 
-    with pytest.raises(ValueError, match="requires --sft-max-in-flight-steps >= 2"):
-        arguments_module._normalize_sft_max_in_flight_steps(args, is_offline=True)
+    arguments_module._normalize_sft_max_in_flight_steps(args, is_offline=True)
+    assert args.max_staleness == 0
 
 
-def test_sft_async_prepack_rejects_zero_max_staleness_without_alias(arguments_module):
+def test_sft_legacy_prepack_allows_zero_max_staleness_without_alias(arguments_module):
     args = SimpleNamespace(sft_max_in_flight_steps=None, sft_async_prepack=True, max_staleness=0)
 
-    with pytest.raises(ValueError, match="requires --max-staleness >= 1"):
-        arguments_module._normalize_sft_max_in_flight_steps(args, is_offline=True)
+    arguments_module._normalize_sft_max_in_flight_steps(args, is_offline=True)
+    assert args.max_staleness == 0
 
 
 def test_sft_async_prepack_maps_two_in_flight_steps_to_one_stale_step(arguments_module):
@@ -46,27 +46,10 @@ def test_sft_without_async_prepack_allows_one_in_flight_step(arguments_module):
     assert args.max_staleness == 0
 
 
-def test_sft_train_data_prefetch_rejects_async_prepack(arguments_module):
-    args = SimpleNamespace(
-        sft_train_data_prefetch=True,
-        sft_async_prepack=True,
-        per_rank_fetch=True,
-        max_staleness=1,
-    )
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        arguments_module._validate_sft_train_data_prefetch(args, is_offline=True)
-
-
-def test_sft_train_data_prefetch_allows_raw_only_mode(arguments_module):
-    args = SimpleNamespace(
-        sft_train_data_prefetch=True,
-        sft_async_prepack=False,
-        per_rank_fetch=True,
-        max_staleness=1,
-    )
-
-    arguments_module._validate_sft_train_data_prefetch(args, is_offline=True)
+def test_sft_rejects_zero_in_flight_steps(arguments_module):
+    args = SimpleNamespace(sft_max_in_flight_steps=0, max_staleness=0)
+    with pytest.raises(ValueError, match="must be >= 1"):
+        arguments_module._normalize_sft_max_in_flight_steps(args, is_offline=True)
 
 
 @pytest.mark.parametrize("loss_type", ["sft", "sft_loss", "sft-loss", "dpo", "rm"])
@@ -166,3 +149,41 @@ def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(
     assert args.no_load_rng is (load_mode != "resume")
     assert args.dpo_reference_free is False
     assert args.ckpt_step == (7 if source == "megatron" and load_mode == "new" else 100)
+
+
+@pytest.mark.parametrize("mode", ["bridge", "raw"])
+def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module, tmp_path, mode):
+    args = _opd_args()
+    vars(args).update(
+        loss_type="sft",
+        generation_task="i2i",
+        train_backend="fsdp",
+        prompt_data=["/train.jsonl"],
+        use_dynamic_batch_size=False,
+        balance_data=False,
+        n_samples_per_prompt=1,
+        sft_oversize_strategy="keep",
+        sft_oversize_custom_function_path=None,
+        load=str(tmp_path / "i2i_sft"),
+        start_rollout_id=7,
+        megatron_to_hf_mode=mode,
+        no_load_optim=False,
+        no_load_rng=False,
+        finetune=False,
+    )
+    arguments_module.slime_validate_args(args)
+    assert args.load == str(tmp_path / "i2i_sft")
+    assert args.start_rollout_id == 7
+    assert not args.balance_data
+    assert not args.use_dynamic_batch_size
+    assert not args.no_load_optim
+    assert not args.no_load_rng
+    assert not args.finetune
+
+
+@pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
+def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    assert parser.parse_args(cli).sft_packing_strategy == expected

@@ -65,7 +65,9 @@ class _FakeManager(MultiEngineManager):
     """A minimal concrete manager: one engine per rank, no placement group
     (hooks return sentinel values that the test never inspects)."""
 
-    def __init__(self, num_slots: int, *, owns_pg: bool = False, log_prefix: str = "[fake]"):
+    def __init__(
+        self, num_slots: int, *, nodes_per_engine: int = 1, owns_pg: bool = False, log_prefix: str = "[fake]"
+    ):
         self._made: list[_FakeEngine] = []
         self._dead_at_init: set[int] = set()
         self._removed_pg = False
@@ -73,6 +75,7 @@ class _FakeManager(MultiEngineManager):
         super().__init__(
             SimpleNamespace(),
             num_slots=num_slots,
+            nodes_per_engine=nodes_per_engine,
             engine_actor_cls=_FakeEngineActorCls,
             log_prefix=log_prefix,
         )
@@ -105,6 +108,7 @@ def _patch_ray(monkeypatch):
 
     created: list[_FakeEngine] = []
     killed: list[_FakeEngine] = []
+    state = SimpleNamespace(created=created, killed=killed, fail_create_rank=None)
 
     def fake_remote(cls):
         if cls is not _FakeEngineActorCls:
@@ -116,6 +120,8 @@ def _patch_ray(monkeypatch):
                 class _Ctor:
                     @staticmethod
                     def remote(args, *, rank, worker_type, base_gpu_id, **ctor_kwargs):
+                        if rank == state.fail_create_rank:
+                            raise RuntimeError("actor creation failed")
                         engine = _FakeEngine(f"engine-{rank}")
                         created.append(engine)
                         return engine
@@ -146,7 +152,7 @@ def _patch_ray(monkeypatch):
         sys.modules["ray.util.placement_group"], "placement_group_table", lambda pg: {"state": "REMOVED"}
     )
 
-    yield SimpleNamespace(created=created, killed=killed)
+    yield state
 
 
 def test_fanout_isolates_one_dead_engine_from_the_rest(_patch_ray):
@@ -241,7 +247,7 @@ def test_dead_ray_actor_is_acknowledged_and_recoverable(_patch_ray, monkeypatch)
 def test_recover_rebuilds_only_the_dead_slot(_patch_ray):
     manager = _FakeManager(num_slots=2)
     original_engine_1 = manager.all_engines[1]
-    manager.all_engines[0] = None  # simulate a prior retirement
+    manager._retire_engines([0])
 
     rebuilt = manager.recover()
 
@@ -255,7 +261,7 @@ def test_recover_raises_on_total_wipeout(_patch_ray, monkeypatch):
     import relax.distributed.ray.multi_engine_manager as mem
 
     manager = _FakeManager(num_slots=1)
-    manager.all_engines[0] = None
+    manager._retire_engines([0])
 
     def failing_options(**kwargs):
         class _Ctor:
@@ -469,3 +475,133 @@ def test_recovery_never_counts_uncleaned_startup_as_rebuilt(_patch_ray, monkeypa
         manager.recover()
     assert manager.inference.state == "failed"
     assert manager._cleanup_pending == {0}
+
+
+def test_shutdown_cleans_follower_slots_and_preserves_borrowed_placement_group(_patch_ray, monkeypatch):
+    removed_pgs = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed_pgs.append)
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    engines = list(manager.all_engines)
+    for engine in engines:
+        engine.calls.clear()
+
+    manager.shutdown()
+
+    assert all(engine.calls == ["shutdown"] for engine in engines)
+    assert _patch_ray.killed == engines
+    assert manager.all_engines == [None] * 4
+    assert manager._engine_placements == {}
+    assert removed_pgs == []
+
+
+def test_offload_onload_rebuilds_whole_multinode_group_and_preserves_other_group(_patch_ray):
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    original_engines = list(manager.all_engines)
+    for engine in original_engines:
+        engine.calls.clear()
+    original_engines[0].dead_methods = frozenset({"release_memory_occupation"})
+
+    manager.offload()
+
+    assert manager.all_engines == [None, None, *original_engines[2:]]
+    assert _patch_ray.killed == original_engines[:2]
+    assert all("shutdown" in engine.calls for engine in original_engines[:2])
+
+    manager.onload()
+
+    for rank in (0, 1):
+        assert manager.all_engines[rank] is not original_engines[rank]
+        assert manager.all_engines[rank].calls == ["init"]
+    assert manager.all_engines[2:] == original_engines[2:]
+    assert original_engines[2].calls == ["release_memory_occupation", "resume_memory_occupation"]
+    assert original_engines[3].calls == []
+
+
+def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_ray, monkeypatch):
+    manager = _FakeManager(num_slots=2, nodes_per_engine=2)
+    engines = list(manager.all_engines)
+    shared_pg = ("shared-pg", [0, 1], [0, 0])
+    manager._engine_placements = {0: (shared_pg, True), 1: (shared_pg, False)}
+    removed_pgs = []
+
+    def remove_pg(pg):
+        assert all(engine in _patch_ray.killed for engine in engines)
+        assert all("shutdown" in engine.calls for engine in engines)
+        removed_pgs.append(pg)
+
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove_pg)
+    manager.shutdown()
+
+    assert removed_pgs == ["shared-pg"]
+    assert manager.all_engines == [None, None]
+    assert manager._engine_placements == {}
+
+
+@pytest.mark.parametrize("failure", ["actor_creation", "address", "init"])
+def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_patch_ray, monkeypatch, failure):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    healthy_engines = manager.all_engines[2:]
+    manager.all_engines[0].dead_methods = frozenset({"release_memory_occupation"})
+    manager.offload()
+    _patch_ray.created.clear()
+    _patch_ray.killed.clear()
+    shared_pg = ("shared-pg", [0, 1], [0, 0])
+    removed_pgs = []
+
+    def resolve_placement(rank):
+        return shared_pg, rank == 0, rank
+
+    def remove_pg(pg):
+        assert all(engine in _patch_ray.killed for engine in _patch_ray.created)
+        assert all("shutdown" in engine.calls for engine in _patch_ray.created)
+        removed_pgs.append(pg)
+
+    monkeypatch.setattr(manager, "_resolve_placement", resolve_placement)
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove_pg)
+    if failure == "actor_creation":
+        _patch_ray.fail_create_rank = 0
+    elif failure == "address":
+
+        def fail_address(**kwargs):
+            raise ConnectionError("engine unavailable during port allocation")
+
+        monkeypatch.setattr(manager, "_allocate_engine_addr_and_ports", fail_address)
+    elif failure == "init":
+        original_get = mem.ray.get
+
+        def fail_init(handle_or_list, timeout=None):
+            if isinstance(handle_or_list, list):
+                raise RuntimeError("follower initialization failed")
+            return original_get(handle_or_list, timeout=timeout)
+
+        monkeypatch.setattr(mem.ray, "get", fail_init)
+
+    with pytest.raises((RuntimeError, ConnectionError)):
+        manager.recover()
+
+    assert removed_pgs == ["shared-pg"]
+    assert manager.all_engines == [None, None, *healthy_engines]
+    assert set(manager._engine_placements) == {2, 3}
+    assert all(engine not in _patch_ray.killed for engine in healthy_engines)
+
+
+def test_owned_head_transfers_pg_to_failed_borrowed_follower_until_retry(_patch_ray, monkeypatch):
+    manager = _FakeManager(num_slots=2, nodes_per_engine=2)
+    head, follower = manager.all_engines
+    pg = ("shared-pg", [0, 1], [0, 0])
+    manager._engine_placements = {0: (pg, True), 1: (pg, False)}
+    follower.dead_methods = frozenset({"shutdown"})
+    removed = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed.append)
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        manager.shutdown()
+    assert manager.all_engines == [None, follower]
+    assert manager._engine_placements == {1: (pg, True)}
+    assert removed == []
+    follower.dead_methods = frozenset()
+    manager.shutdown()
+    assert removed == ["shared-pg"]
+    assert manager._engine_placements == {}
+    assert _patch_ray.killed == [head, follower]

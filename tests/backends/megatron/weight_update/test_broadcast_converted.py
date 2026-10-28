@@ -10,60 +10,41 @@ multi-rank scenarios.
 
 from __future__ import annotations
 
-import sys
-from types import ModuleType
+import ast
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 
 from relax.utils.types import ParamInfo
 
 
-# ---------------------------------------------------------------------------
-# Module-level mocking: stub out megatron.core so we can import without GPU.
-# ---------------------------------------------------------------------------
-
-_MEGATRON_MODULES = [
-    "megatron",
-    "megatron.core",
-    "megatron.core.mpu",
-    "megatron.core.transformer",
-    "megatron.core.transformer.transformer_layer",
-    "megatron.core.tensor_parallel",
-    "megatron.bridge",
-    "megatron.bridge.models",
-    "megatron.bridge.peft",
-    "megatron.bridge.peft.lora",
+# Load the actual collective functions without importing the training backend.
+# Global Megatron stubs trigger model/MTP registration in spawned workers and
+# make this CPU/Gloo regression depend on the installed GPU image.
+_SOURCE = Path(__file__).resolve().parents[4] / "relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py"
+_FUNCTIONS = {
+    "_broadcast_converted_bucket",
+    "_broadcast_converted_phase",
+    "_compute_slot_size",
+    "_decode_metadata",
+    "_encode_metadata",
+}
+_CONSTANTS = {"_DTYPE_TO_CODE", "_CODE_TO_DTYPE"}
+_nodes = [
+    node
+    for node in ast.parse(_SOURCE.read_text()).body
+    if (isinstance(node, ast.FunctionDef) and node.name in _FUNCTIONS)
+    or (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in _CONSTANTS for t in node.targets))
 ]
-
-_MISSING = object()
-_saved = {}
-for _mod in _MEGATRON_MODULES:
-    _saved[_mod] = sys.modules.get(_mod, _MISSING)
-    sys.modules[_mod] = ModuleType(_mod)
-    if _mod in {"megatron", "megatron.core", "megatron.core.transformer", "megatron.bridge", "megatron.bridge.peft"}:
-        sys.modules[_mod].__path__ = []
-sys.modules["megatron.core"].mpu = sys.modules["megatron.core.mpu"]
-sys.modules["megatron.core.transformer.transformer_layer"].get_transformer_layer_offset = MagicMock(return_value=0)
-sys.modules["megatron.bridge.peft.lora"].LoRAMerge = MagicMock
-
-try:
-    pytest.importorskip("triton")
-
-    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
-        _broadcast_converted_bucket,
-        _broadcast_converted_phase,
-        _compute_slot_size,
-        _decode_metadata,
-        _encode_metadata,
-    )
-finally:
-    for _mod, _orig in _saved.items():
-        if _orig is _MISSING:
-            sys.modules.pop(_mod, None)
-        else:
-            sys.modules[_mod] = _orig
+_scope = {"torch": torch, "dist": torch.distributed, "mpu": SimpleNamespace()}
+exec(compile(ast.Module(body=_nodes, type_ignores=[]), str(_SOURCE), "exec"), _scope)
+_broadcast_converted_bucket = _scope["_broadcast_converted_bucket"]
+_broadcast_converted_phase = _scope["_broadcast_converted_phase"]
+_compute_slot_size = _scope["_compute_slot_size"]
+_decode_metadata = _scope["_decode_metadata"]
+_encode_metadata = _scope["_encode_metadata"]
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +306,8 @@ class TestBroadcastQuantizedBucket:
 
     @staticmethod
     def _run_bucket(bucket_infos, all_converted, pp_size, ep_size):
-        with (
-            patch("relax.backends.megatron.weight_update.hf_weight_iterator_bridge.dist") as mock_dist,
-            patch("relax.backends.megatron.weight_update.hf_weight_iterator_bridge.mpu") as mock_mpu,
-        ):
+        mock_dist, mock_mpu = MagicMock(), MagicMock()
+        with patch.dict(_broadcast_converted_bucket.__globals__, dist=mock_dist, mpu=mock_mpu):
             mock_dist.get_rank.return_value = 0
             mock_mpu.get_pipeline_model_parallel_world_size.return_value = pp_size
             mock_mpu.get_expert_model_parallel_world_size.return_value = ep_size
@@ -518,3 +497,85 @@ class TestPPxEPIntegration:
             "layer1.experts.1.gate_proj.weight_scale",
         }
         assert set(all_names) == expected_names
+
+
+def _cached_gloo_worker(rank: int, rendezvous: str) -> None:
+    """Exercise real PP->EP collectives locally, without Ray or CUDA."""
+    from datetime import timedelta
+
+    import torch.distributed as distributed
+
+    distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    try:
+        pp_groups = [distributed.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+        ep_groups = [distributed.new_group(ranks) for ranks in ([0, 2], [1, 3])]
+        pp, ep = pp_groups[rank // 2], ep_groups[rank % 2]
+        infos = [_make_param_info(f"expert{i}", i) for i in range(4)]
+        caches = ({}, {})
+        previous = None
+        actual_reduce = distributed.all_reduce
+        for step in range(5):
+            # Only rank 3 changes schema. Both PP and EP must refresh together.
+            expected = []
+            for owner in range(4):
+                name = f"expert{owner}" if step < 2 or owner != 3 else "renamed_expert3"
+                values = _make_converted(name, value=10 * step + owner)
+                if step >= 2 and owner == 3:
+                    values[0] = (values[0][0], torch.full((2, 3), step, dtype=torch.int64).t())
+                if step == 4 and owner == 2:
+                    values = []
+                expected.append(values)
+            local = [values if owner == rank else None for owner, values in enumerate(expected)]
+            if step == 3 and rank == 1:
+                # A local eviction must not desynchronize the collective sequence.
+                caches[0].clear()
+            with (
+                patch.dict(
+                    _broadcast_converted_bucket.__globals__,
+                    mpu=SimpleNamespace(
+                        get_pipeline_model_parallel_world_size=lambda: 2,
+                        get_expert_model_parallel_world_size=lambda: 2,
+                        get_pipeline_model_parallel_group=lambda: pp,
+                        get_expert_model_parallel_group=lambda: ep,
+                    ),
+                ),
+                patch.object(distributed, "all_reduce", wraps=actual_reduce) as reduce,
+            ):
+                result = _broadcast_converted_bucket(infos, local, "cpu", phase_caches=caches)
+                expected_calls = {0: 4, 1: 2, 2: 3 + (rank >= 2), 3: 2 + (rank < 2), 4: 3 + (rank >= 2)}
+                assert reduce.call_count == expected_calls[step]
+            assert [name for name, _ in result] == [name for values in expected for name, _ in values]
+            for (_, actual), (_, target) in zip(result, [pair for values in expected for pair in values], strict=True):
+                torch.testing.assert_close(actual, target)
+            if previous is not None:
+                for (_, tensor), saved in zip(previous[0], previous[1], strict=True):
+                    torch.testing.assert_close(tensor, saved)
+            previous = result, [tensor.clone() for _, tensor in result]
+
+            # The retained plan must not keep payload tensors or process groups.
+            def check_cpu_metadata(value):
+                assert not isinstance(value, (torch.Tensor, distributed.ProcessGroup))
+                if isinstance(value, dict):
+                    for item in value.values():
+                        check_cpu_metadata(item)
+                elif isinstance(value, (tuple, list)):
+                    for item in value:
+                        check_cpu_metadata(item)
+
+            check_cpu_metadata(caches)
+    finally:
+        distributed.destroy_process_group()
+
+
+def test_cached_broadcast_pp_ep_values_and_collective_invalidation(tmp_path):
+    import torch.multiprocessing as multiprocessing
+
+    multiprocessing.start_processes(
+        _cached_gloo_worker,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
+    )

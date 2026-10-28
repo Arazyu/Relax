@@ -47,7 +47,7 @@ async def test_deferred_writeback_precedes_publish_and_never_overlaps(monkeypatc
     rewards.batched_async_rm = score
     monkeypatch.setitem(sys.modules, rewards.__name__, rewards)
     utils = ModuleType("relax.utils.utils")
-    utils.post_process_rewards = lambda args, samples: ([s.reward for s in samples], [s.reward for s in samples])
+    utils.post_process_rewards = lambda args, samples: [s.reward for s in samples]
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
     samples = [SimpleNamespace(index=7, response_length=1), SimpleNamespace(index=7, response_length=2)]
 
@@ -71,6 +71,7 @@ async def test_deferred_writeback_precedes_publish_and_never_overlaps(monkeypatc
     async def publish():
         assert not active
         assert all(hasattr(s, "teacher_log_probs") and hasattr(s, "_inference_reward_result") for s in samples)
+        assert [s._inference_reward_result for s in samples] == [0.25, 0.75]
         events.append("publish")
 
     args = SimpleNamespace(
@@ -144,7 +145,7 @@ async def test_deferred_eval_preserves_prompt_groups_and_returned_rewards(monkey
 
     def process(args, rows):
         assert not args.rewards_normalization
-        return [0.2, 0.8, 0.2, 0.8], [99] * 4
+        return [0.2, 0.8, 0.2, 0.8]
 
     utils.post_process_rewards = process
     monkeypatch.setitem(sys.modules, utils.__name__, utils)

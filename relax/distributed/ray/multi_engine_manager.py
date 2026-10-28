@@ -194,9 +194,9 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
 
     def _init_engines(self, ranks: list[int]) -> int:
-        """Create actors for the given slot ranks, fire init.remote() for all
-        of them without blocking, then await everything in one ray.get so a
-        large engine doesn't pay N x cold-load latency.
+        """Create actors for uninitialized or retired slot ranks, fire
+        init.remote() for all of them, then await everything in one ray.get so
+        a large engine doesn't pay N x cold-load latency.
 
         On failure, kill any newly created engines and leave their slots None
         so the caller sees them as still-dead rather than silently healthy.
@@ -279,9 +279,13 @@ class MultiEngineManager:
         if not owns_pg:
             self._engine_placements.pop(rank, None)
             return True
-        if any(i != rank and other[0][0] == pg_tuple[0] for i, other in self._engine_placements.items()):
-            self._engine_placements.pop(rank, None)
-            return True
+        for other_rank, other in self._engine_placements.items():
+            if other_rank != rank and other[0][0] == pg_tuple[0]:
+                # Carry ownership to the remaining slot, even when it originally
+                # borrowed the head's PG. Release only after its process exits.
+                self._engine_placements[other_rank] = (other[0], True)
+                self._engine_placements.pop(rank, None)
+                return True
         try:
             from ray.util.placement_group import placement_group_table, remove_placement_group
 
@@ -502,17 +506,15 @@ class MultiEngineManager:
         return dead
 
     def _retire_engines(self, ranks: list[int]) -> None:
-        """Tear down dead engines and null their slots so recover() rebuilds
-        them."""
-        self._cleanup_slots([i for rank in ranks for i in range(rank, rank + self.nodes_per_engine)])
+        """Retire the whole logical engine containing each given slot."""
+        heads = sorted({rank // self.nodes_per_engine * self.nodes_per_engine for rank in ranks})
+        self._cleanup_slots([i for rank in heads for i in range(rank, rank + self.nodes_per_engine)])
 
     def recover(self) -> set:
-        """Rebuild engines whose slot is None. Returns the ranks rebuilt.
+        """Rebuild engines with missing slots. Returns all slot ranks rebuilt.
 
-        ``_init_engines`` already skips non-None slots, so it rebuilds exactly
-        the holes, reusing the same placement-group bundles (or creating fresh
-        dedicated ones) and probing fresh ports (surviving engines' ports are
-        bound, so they're skipped).
+        Retirement clears every slot in a logical engine, so recovery rebuilds
+        its whole TP group.
         """
         self._require_cleanup_complete()
         dead = [i for i in self._managed_ranks() if self.all_engines[i] is None]

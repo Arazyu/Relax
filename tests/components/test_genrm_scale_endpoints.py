@@ -932,3 +932,34 @@ class TestUnifiedGatewayIntegration(unittest.TestCase):
                 await replica.gateway.aclose()
 
         _run(exercise())
+
+
+class TestDiscoveryObservation(unittest.TestCase):
+    def test_capacity_observation_is_complete_only_for_stable_authoritative_pool(self):
+        cases = [
+            ({"current": 1, "occupied": 1, "pending_cleanup": 0}, None),
+            ({"current": 1, "occupied": 2, "pending_cleanup": 0}, "capacity_transition"),
+            ({"current": 2, "occupied": 2, "pending_cleanup": 0}, "capacity_transition"),
+            ({"current": 1, "occupied": 1, "pending_cleanup": 1}, "cleanup_pending"),
+        ]
+        for capacity, reason in cases:
+            with self.subTest(capacity=capacity):
+                replica = _replica(_fake_manager({"get_engine_capacity": lambda: capacity}))
+                observation = _run(replica.get_engines())["observation"]
+                self.assertEqual(observation["complete"], reason is None)
+                self.assertEqual(
+                    observation["issues"], [] if reason is None else [{"scope": "__default__", "reason": reason}]
+                )
+
+    def test_missing_or_failed_capacity_does_not_claim_complete_observation(self):
+        def fail():
+            raise RuntimeError("capacity unavailable")
+
+        for hooks, reason in [
+            ({}, "capacity_protocol_missing"),
+            ({"get_engine_capacity": fail}, "capacity_unavailable"),
+        ]:
+            with self.subTest(reason=reason):
+                observation = _run(_replica(_fake_manager(hooks)).get_engines())["observation"]
+                self.assertFalse(observation["complete"])
+                self.assertEqual(observation["issues"], [{"scope": "__default__", "reason": reason}])

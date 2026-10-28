@@ -15,6 +15,7 @@ import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
+from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 from transfer_queue import SeqlenBalancedSampler
 
@@ -48,6 +49,22 @@ from relax.utils.s3_model_loader import (
     prepare_local_model,
     read_s3_model_config,
     remove_stale_s3_model_caches,
+)
+from relax.utils.tq.config import (
+    build_backend_config,
+    resolve_mooncake_master_address,
+    validate_config,
+    validate_mooncake_runtime_contract,
+)
+from relax.utils.tq.lifecycle import (
+    TqHandshakeIsolationError,
+    TqInitResult,
+    close_tq_owner,
+    initialize_tq_with_fallback,
+    reap_unusable_tq_controller,
+    safe_exception_kind,
+    uses_mooncake,
+    verify_cluster_attach,
 )
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
@@ -179,6 +196,8 @@ class Controller:
         # training thread must always refer to the same event generation.
         if not hasattr(self, "_restart_done_event"):
             self._restart_done_event = threading.Event()
+        if not hasattr(self, "_restart_lock"):
+            self._restart_lock = threading.RLock()
         if not hasattr(self, "_restart_consumed_event"):
             # A HealthChecker snapshot may contain multiple unhealthy roles.
             # Do not let the next callback overwrite this cycle's mode/error
@@ -195,54 +214,76 @@ class Controller:
             self._pending_task_refs_lock = threading.Lock()
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
+        self._tq_owner = None
+        self._tq_legacy_init = False
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
+        self._startup_abort_event.clear()
         self._model_cache_node_bindings: dict[str, tuple[Any, int]] = {}
         self._model_cache_node_ids: set[str] = set()
 
         # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
         # is launched (RL is resolved later in placement_group.py).
-        resolve_sft_num_rollout(self.config)
+        self._sft_line_offsets_cache = resolve_sft_num_rollout(self.config)
 
-        # Initialize data management system
-        self._initialize_data_system()
-        self.dcs, self.config.coordinator_url = create_dcs_deployment(
-            ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
-        )
-
-        self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
-        if self._metrics_service_enabled:
-            self._deploy_metrics_service()
-
-        if self.config.use_agentic_rollout and not self.config.debug_train_only:
-            deploy_agentic_chat_api_services(
-                config=self.config,
-                runtime_env=self.runtime_env,
-            )
-        self._autoscaler_config = None
         try:
-            self.register_all_serve()
-        except Exception as e:
-            self._rollback_inference_startup()
-            self._report_error_to_metrics_service(e)
-            raise
-
-        autoscaler_config_path = getattr(config, "autoscaler_config", None)
-        if autoscaler_config_path:
-            from relax.utils.autoscaler.config import AutoscalerConfig
-            from relax.utils.utils import get_serve_url
-
-            rollout_service_url = get_serve_url("/rollout")
-            self._autoscaler_config = AutoscalerConfig.from_yaml(autoscaler_config_path, rollout_service_url)
-            self._deploy_autoscaler_service()
-
-        # Start health management with service restart callback
-        if self._health_check_enabled:
-            self._health_manager.start(
-                on_unhealthy=self._on_service_unhealthy,
-                on_fatal=self._on_service_fatal,
+            # Include data-system initialization in the constructor cleanup
+            # transaction: a cluster-handshake orchestration error can happen
+            # after the owner actor has created global TQ state.
+            self._initialize_data_system()
+            self.dcs, self.config.coordinator_url = create_dcs_deployment(
+                ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
             )
-            logger.info("Global health check system enabled")
-        else:
-            logger.info("Global health check system disabled (use --use-health-check to enable)")
+
+            self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
+            if self._metrics_service_enabled:
+                self._deploy_metrics_service()
+
+            if self.config.use_agentic_rollout and not self.config.debug_train_only:
+                deploy_agentic_chat_api_services(
+                    config=self.config,
+                    runtime_env=self.runtime_env,
+                )
+            self._autoscaler_config = None
+            try:
+                self.register_all_serve()
+            except Exception as e:
+                self._report_error_to_metrics_service(e)
+                raise
+
+            autoscaler_config_path = getattr(config, "autoscaler_config", None)
+            if autoscaler_config_path:
+                from relax.utils.autoscaler.config import AutoscalerConfig
+                from relax.utils.utils import get_serve_url
+
+                rollout_service_url = get_serve_url("/rollout")
+                self._autoscaler_config = AutoscalerConfig.from_yaml(autoscaler_config_path, rollout_service_url)
+                self._deploy_autoscaler_service()
+
+            # Start health management with service restart callback
+            if self._health_check_enabled:
+                self._health_manager.start(
+                    on_unhealthy=self._on_service_unhealthy,
+                    on_fatal=self._on_service_fatal,
+                )
+                logger.info("Global health check system enabled")
+            else:
+                logger.info("Global health check system disabled (use --use-health-check to enable)")
+        except Exception:
+            # Release this job's TQ state immediately if initialization fails,
+            # before the entrypoint runs its broader shutdown cleanup.
+            logger.error("Controller construction failed; closing any initialized TQ state.")
+            try:
+                self._rollback_inference_startup()
+            except Exception as cleanup_error:
+                logger.warning(f"Inference startup rollback failed ({safe_exception_kind(cleanup_error)}).")
+            try:
+                self._close_data_system()
+            except Exception as cleanup_error:  # pragma: no cover - best effort
+                logger.warning(
+                    f"TQ owner cleanup during failed construction failed ({safe_exception_kind(cleanup_error)})."
+                )
+            raise
 
     def _cleanup_s3_model_weights_after_init(self, *, force: bool = False) -> None:
         """Remove policy weight shards after every startup consumer is
@@ -309,6 +350,10 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
+        from relax.engine.sft.runtime import is_i2i_sft
+
+        required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
+        required_node_resource = next(iter(required_node_resources), None)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
         if (
             getattr(self.config, "fully_async", False)
@@ -321,11 +366,24 @@ class Controller:
                 balance_unit_multiplier=self.config.n_samples_per_prompt,
             )
             logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
+        elif is_i2i_sft(self.config):
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
         elif algo_key == "sft":
-            sampler = SeqlenBalancedSampler(
-                n_samples_per_prompt=self.config.n_samples_per_prompt,
-                dp_size=dp_size,
-            )
+            from relax.utils.data.wholepack import WholepackSampler, config_contract, enabled
+
+            if enabled(self.config):
+                capacity, pad_size = config_contract(self.config)
+                sampler = WholepackSampler(
+                    n_samples_per_prompt=self.config.n_samples_per_prompt,
+                    dp_size=dp_size,
+                    capacity=capacity,
+                    pad_size=pad_size,
+                )
+            else:
+                sampler = SeqlenBalancedSampler(
+                    n_samples_per_prompt=self.config.n_samples_per_prompt,
+                    dp_size=dp_size,
+                )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
         elif getattr(self.config, "balance_data", False):
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
@@ -334,22 +392,242 @@ class Controller:
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
             logger.info(f"Using IdentityWindowSampler with sequential row placement, dp_size={dp_size}")
 
+        controller_config = {
+            "sampler": sampler,
+            "polling_mode": self.config.polling_mode,
+            "required_node_resource": required_node_resource,
+        }
+        backend_config = self._resolve_tq_backend()
+        if "SimpleStorage" in backend_config:
+            backend_config["SimpleStorage"]["required_node_resource"] = required_node_resource
         tq_config = OmegaConf.create(
             {
-                "controller": {
-                    "sampler": sampler,
-                    "polling_mode": self.config.polling_mode,
-                },
-                "backend": {
-                    "SimpleStorage": {
-                        "num_data_storage_units": self.config.num_data_storage_units,
-                    },
-                },
+                "controller": controller_config,
+                "backend": backend_config,
             },
             flags={"allow_objects": True},
         )
-        tq_config = tq.init(conf=tq_config) or tq_config
-        self.config.tq_config = tq_config
+
+        if getattr(self.config, "tq_rdma_mode", "off") == "off":
+            # Preserve the upstream SimpleStorage ownership model: the first
+            # tq.init runs inside Controller and no _TransferQueueOwner actor
+            # is created.  Lifecycle hardening still applies: the F10 reaper
+            # removes a provably half-initialised controller, worker attaches
+            # use a 60-second default deadline, and constructor failure closes
+            # any legacy tq.init completed by this process.
+            reap_unusable_tq_controller()
+            self._tq_owner = None
+            self._tq_legacy_init = True
+            self.config.tq_config = tq.init(conf=tq_config) or tq_config
+            logger.info("[dataplane] backend=SimpleStorage (default in-process init, no owner actor)")
+            return
+
+        fallback_config = None
+        if backend_config.get("storage_backend") == "MooncakeStore":
+            from relax.utils.tq.config import build_simple_storage_config
+
+            fallback_config = OmegaConf.create(
+                {
+                    "controller": controller_config,
+                    "backend": build_simple_storage_config(
+                        total_storage_size=None,
+                        num_data_storage_units=self.config.num_data_storage_units,
+                    ),
+                },
+                flags={"allow_objects": True},
+            )
+            fallback_config.backend.SimpleStorage.required_node_resource = required_node_resource
+
+        init_result = initialize_tq_with_fallback(
+            tq_config,
+            mode=getattr(self.config, "tq_rdma_mode", "off"),
+            fallback_conf=fallback_config,
+        )
+        # The owner becomes this Controller's cleanup responsibility before
+        # the cluster handshake.  Otherwise a driver-side scheduling error can
+        # escape while ``self._tq_owner`` is still None and orphan global TQ
+        # state during constructor failure.
+        self._tq_owner = init_result.owner
+        if uses_mooncake(init_result.config):
+            init_result = self._confirm_mooncake_attach(init_result, fallback_config)
+        self._tq_owner = init_result.owner
+        self.config.tq_config = init_result.config
+        if init_result.fallback_reason:
+            logger.warning(f"[dataplane] effective backend=SimpleStorage fallback={init_result.fallback_reason}")
+        logger.info("[dataplane] controller ownership=owner")
+
+    def _confirm_mooncake_attach(self, init_result: TqInitResult, fallback_config) -> TqInitResult:
+        """Validate Mooncake attach/setup on every alive Ray node.
+
+        There is no static ``/sys`` probe.  TQ clients live in Ray Serve
+        replicas and 0-CPU actors with no placement binding, so they may land
+        on any alive node, and a worker-side ``tq.init`` has no timeout of its
+        own.  Each alive node therefore performs a bounded attach with the
+        stored config, confirms a Mooncake manager whose client is configured
+        for RDMA, and detaches.  This is configuration/setup evidence, not
+        negotiated-transport or wire proof.
+        Failures are aggregated here so ``auto`` converges the whole job on one
+        backend instead of failing a single replica mid-deployment.
+
+        On failure the Mooncake state created for this attempt is torn down
+        *before* any SimpleStorage initialisation: a surviving half-initialised
+        controller would make the next ``tq.init`` poll forever (F10).
+        """
+
+        def _close_owned_attempt() -> None:
+            # Retain the handle if teardown fails.  The constructor's outer
+            # cleanup boundary can then retry instead of losing the only
+            # reference to possibly live process-global TQ state.
+            close_tq_owner(init_result.owner)
+            self._tq_owner = None
+
+        try:
+            failures = verify_cluster_attach(init_result.config)
+        except TqHandshakeIsolationError:
+            _close_owned_attempt()
+            raise RuntimeError(
+                "Mooncake attach handshake workers could not be confirmed stopped; global fallback is unsafe"
+            ) from None
+        except Exception as error:
+            # Defensive boundary: verify_cluster_attach normally converts
+            # driver failures into stable summaries.  An unexpected exception
+            # still must not strand the owner created for this attempt.
+            _close_owned_attempt()
+            raise RuntimeError(
+                f"Mooncake attach handshake orchestration failed ({safe_exception_kind(error)})"
+            ) from None
+        if not failures:
+            logger.info("[dataplane] Mooncake attach handshake passed on all alive nodes.")
+            return init_result
+
+        detail = "; ".join(failures)
+        mode = getattr(self.config, "tq_rdma_mode", "off")
+        if mode != "auto" or fallback_config is None:
+            # ``required`` must fail loudly after cleaning this job's owner.
+            _close_owned_attempt()
+            raise RuntimeError(
+                f"Mooncake attach handshake reported {len(failures)} failure(s) (--tq-rdma-mode={mode}): {detail}"
+            )
+
+        logger.warning(
+            f"[dataplane] Mooncake attach handshake reported {len(failures)} failure(s) ({detail}); "
+            "closing Mooncake state and converging the whole job to SimpleStorage."
+        )
+        # A cleanup failure leaves global TQ state unknown, so it must propagate
+        # instead of starting SimpleStorage on top of a possibly dirty cluster.
+        _close_owned_attempt()
+        fallback_result = initialize_tq_with_fallback(fallback_config, mode="auto")
+        self._tq_owner = fallback_result.owner
+        return TqInitResult(
+            config=fallback_result.config,
+            owner=fallback_result.owner,
+            fallback_reason=f"attach_handshake_failed:{len(failures)}_failures",
+        )
+
+    def _resolve_tq_backend(self) -> dict:
+        """Resolve the TransferQueue ``backend`` config dict.
+
+        This method only validates *configuration*: the requested mode, the
+        TransferQueue correctness contract, the master endpoint and the segment
+        capacity.  It deliberately performs no hardware capability probe -- a
+        ``/sys`` scan cannot see which nodes the scheduler will actually use,
+        and host-RDMA capability is established afterwards by the real attach
+        handshake in :meth:`_confirm_mooncake_attach`.
+
+        SimpleStorage is always built unbounded (see
+        :func:`~relax.utils.tq.config.build_simple_storage_config`).
+
+        ``off`` retains the previous SimpleStorage and ownership semantics.  For
+        ``auto``/``required``, any unmet precondition either falls back to
+        SimpleStorage (``auto``) or fails fast (``required``).
+        """
+        # 1. Validate the requested mode. A malformed mode is a configuration
+        #    error, never a reason to silently run on SimpleStorage.
+        errors = validate_config(self.config)
+        if errors:
+            raise ValueError("Invalid TransferQueue RDMA configuration:\n  " + "\n  ".join(errors))
+
+        mode = getattr(self.config, "tq_rdma_mode", "off")
+
+        def _simple_storage() -> dict:
+            from relax.utils.tq.config import build_simple_storage_config
+
+            return build_simple_storage_config(
+                total_storage_size=None,
+                num_data_storage_units=self.config.num_data_storage_units,
+            )
+
+        def _fall_back_or_raise(reason: str, error: Exception) -> dict:
+            """Every unmet host-RDMA precondition funnels through here.
+
+            ``auto`` converges the whole job on SimpleStorage; ``required`` re-
+            raises so an operator who demanded RDMA never runs silently
+            downgraded.
+            """
+            if mode != "auto":
+                raise RuntimeError(f"--tq-rdma-mode={mode} but {reason}: {error}") from None
+            logger.warning(f"[dataplane] {reason}; auto fallback to SimpleStorage: {error}")
+            return _simple_storage()
+
+        # 2. SimpleStorage short-circuit (default, zero behavior change).
+        if mode == "off":
+            return _simple_storage()
+
+        # 3. Configuration preconditions for the host-RDMA path.
+        device = getattr(self.config, "tq_rdma_device", "")
+        try:
+            validate_mooncake_runtime_contract()
+        except RuntimeError as e:
+            return _fall_back_or_raise(
+                "the installed TransferQueue does not satisfy the Mooncake correctness contract", e
+            )
+        try:
+            master_address = resolve_mooncake_master_address()
+        except RuntimeError as e:
+            # A missing/invalid MC_MASTER_ADDRESS makes MooncakeStore
+            # unreachable for the whole job, so it degrades like any other
+            # unmet precondition rather than aborting an ``auto`` run.
+            return _fall_back_or_raise("the Mooncake master endpoint is not configured", e)
+
+        # 4. Build the backend dict.  Capacity validation reports an
+        #    insufficient segment via ``cap_error``, but it can also *raise* for
+        #    an unusable capacity input (garbage
+        #    ``RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB``, missing ``seq_length``); both
+        #    are configuration failures and must degrade identically.
+        try:
+            backend_dict, cap_error = build_backend_config(
+                self.config,
+                device=device,
+                master_address=master_address,
+            )
+        except RuntimeError as e:
+            return _fall_back_or_raise("the segment-capacity configuration is unusable", e)
+        if cap_error:
+            return _fall_back_or_raise("segment capacity insufficient", RuntimeError(cap_error))
+
+        # 5. One startup line stating what was requested and what will run. The
+        #    effective transport is only confirmed once the cluster-wide attach
+        #    handshake passes.
+        device_selection = "explicit" if device else "auto"
+        logger.info(f"[dataplane] requested: rdma_mode={mode} device_selection={device_selection}")
+        logger.info(
+            f"[dataplane] backend=MooncakeStore protocol=rdma device_selection={device_selection} (pending handshake)"
+        )
+        return backend_dict
+
+    def _close_data_system(self) -> None:
+        """Tear down the data system.
+
+        Default in-process path keeps upstream's plain ``tq.close()``;
+        owner-mediated runs delegate to
+        :func:`relax.utils.tq.lifecycle.close_tq_owner`.
+        """
+        if self._tq_legacy_init:
+            self._tq_legacy_init = False
+            tq.close()
+            return
+        close_tq_owner(self._tq_owner)
+        self._tq_owner = None
 
     def _deploy_metrics_service(self):
         """Deploy the MetricsService as a lightweight Ray Serve deployment.
@@ -400,13 +678,17 @@ class Controller:
             raise
 
     def _cancel_pending_tasks(self) -> None:
-        """Cancel all pending service ObjectRefs to unblock the main thread.
+        """Cancel all pending service task handles to unblock the main thread.
 
         Must be called BEFORE ray.shutdown() during global restart. Without
         this, the main thread remains blocked awaiting ObjectRefs that become
         dangling after ray.shutdown(), causing a fatal C++ crash:
         ``TryReadObjectRefStream API can be used only when the stream has been
         created and not removed.``
+
+        Ray Serve task handles expose ``cancel()``; ObjectRefs require
+        ``ray.cancel()``. Use the appropriate API for each handle and report
+        cancellation failures, which can block restart recovery.
         """
         with self._pending_task_refs_lock:
             refs_to_cancel = list(self._pending_task_refs)
@@ -416,25 +698,40 @@ class Controller:
             return
 
         logger.info(f"[Global Restart] Cancelling {len(refs_to_cancel)} pending task ref(s)...")
+        cancelled = 0
         for ref in refs_to_cancel:
             try:
-                ray.cancel(ref, force=True)
+                # DeploymentResponse / DeploymentResponseGenerator carry their own
+                # cancel(); plain ObjectRefs go through ray.cancel().
+                if isinstance(ref, ray.ObjectRef):
+                    ray.cancel(ref, force=False)
+                elif hasattr(ref, "cancel"):
+                    ref.cancel()
+                else:
+                    logger.warning(
+                        f"[Global Restart] Don't know how to cancel {type(ref).__name__}; "
+                        "the main thread may stay blocked in run_all_services()"
+                    )
+                    continue
+                cancelled += 1
             except Exception as e:
-                logger.debug(f"[Global Restart] Failed to cancel task ref (may already be done): {e}")
-        logger.info("[Global Restart] All pending task refs cancelled")
+                # Cancellation failures must remain visible because they can block restart recovery.
+                logger.warning(f"[Global Restart] Failed to cancel {type(ref).__name__} (may already be done): {e!r}")
+        logger.info(f"[Global Restart] Cancelled {cancelled}/{len(refs_to_cancel)} pending task ref(s)")
 
     def _consume_restart_cycle(self) -> tuple[str, Optional[BaseException]]:
         """Snapshot one completed restart before acknowledging its
         generation."""
-        self._restart_done_event.clear()
-        restart_mode = self._restart_mode or "unknown"
-        restart_error = self._restart_error
+        with self._restart_lock:
+            self._restart_done_event.clear()
+            restart_mode = self._restart_mode or "unknown"
+            restart_error = self._restart_error
 
-        # Commit all state changes for this cycle before publishing the
-        # acknowledgement. After set(), the health checker may immediately
-        # start the next generation and own these fields.
-        self._restarting = False
-        self._restart_mode = None
+            # Commit all state changes for this cycle before publishing the
+            # acknowledgement. After set(), the health checker may immediately
+            # start the next generation and own these fields.
+            self._restarting = False
+            self._restart_mode = None
         self._restart_consumed_event.set()
         return restart_mode, restart_error
 
@@ -478,30 +775,49 @@ class Controller:
         if actor_rollout_pg_roles is None:
             actor_rollout_pg_roles = ACTOR_ROLLOUT_PG_ROLES
         service = None
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
         try:
+            service_config = self.config
+            if role == "sft" and getattr(self, "_sft_line_offsets_cache", None) is not None:
+                service_config = copy.copy(self.config)
+                service_config._sft_line_offsets_cache = self._sft_line_offsets_cache
             service = Service(
                 cls,
                 role=role,
                 healthy=self._health_manager.status,
-                config=self.config,
+                config=service_config,
                 num_gpus=num_gpus,
                 data_source=data_source,
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
                 defer_deploy=True,
                 runtime_env=self.runtime_env,
             )
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=False)
+                return (role, None, "startup phase aborted")
             if not defer_deploy:
                 service.deploy()
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=not defer_deploy)
+                return (role, None, "startup phase aborted")
             logger.info(f"Service {role} has been created successfully")
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to create service {role}: {e}")
             return (role, service, str(e))
 
-    @staticmethod
-    def _deploy_service_task(role, service):
+    def _deploy_service_task(self, role, service):
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
         try:
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=False)
+                return (role, None, "startup phase aborted")
             service.deploy()
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=True)
+                return (role, None, "startup phase aborted")
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to deploy service {role}: {e}")
@@ -517,21 +833,142 @@ class Controller:
         concurrency."""
         if not task_args:
             return {}
-        if self.config.fully_async:
-            logger.info(f"Using parallel service {phase.value} mode with {len(task_args)} services")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(task_args)) as executor:
-                futures = [executor.submit(task, *args) for args in task_args]
-                results = [future.result() for future in concurrent.futures.as_completed(futures)]
-        else:
-            logger.info(f"Using serial service {phase.value} mode (fully_async=False)")
-            results = [task(*args) for args in task_args]
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
+        self._startup_abort_event.clear()
+        executor = None
+        try:
+            if self.config.fully_async:
+                logger.info(f"Using parallel service {phase.value} mode with {len(task_args)} services")
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(task_args))
+                futures = {executor.submit(task, *args): args[0] for args in task_args}
+            else:
+                logger.info(f"Using serial service {phase.value} mode (fully_async=False)")
+                futures = {}
 
-        failed_roles = [(role, error) for role, _service, error in results if error is not None]
-        self.serve_dict.update({role: service for role, service, _error in results if service is not None})
-        if failed_roles:
-            error_msg = "; ".join(f"{role}: {error}" for role, error in failed_roles)
-            raise RuntimeError(f"Failed to {phase.value} {len(failed_roles)} services: {error_msg}")
-        return {role: service for role, service, _error in results}
+            services: dict[Any, Service] = {}
+            result_futures = concurrent.futures.as_completed(futures) if futures else (None for _ in task_args)
+            for future in result_futures:
+                if future is None:
+                    role, service, error = task(*task_args[len(services)])
+                else:
+                    try:
+                        role, service, error = future.result()
+                    except Exception as exc:
+                        role = futures[future]
+                        service = None
+                        error = str(exc)
+                if error is not None:
+                    self._startup_abort_event.set()
+                    failed_services = {role: service} if service is not None else {}
+                    for pending_future, pending_role in futures.items():
+                        if pending_future is future:
+                            continue
+                        if pending_future.done():
+                            try:
+                                done_role, done_service, done_error = pending_future.result()
+                            except Exception:
+                                continue
+                            if done_service is not None:
+                                if done_error is None:
+                                    services[done_role] = done_service
+                                else:
+                                    failed_services[done_role] = done_service
+                        else:
+                            pending_future.cancel()
+                            if phase == ServiceStartupPhase.DEPLOY:
+                                try:
+                                    serve.delete(pending_role)
+                                except Exception as exc:
+                                    logger.warning(
+                                        f"[{pending_role}] Failed to cancel deployment during phase abort: {exc}"
+                                    )
+                    self._abort_service_phase(phase, services, failed_services)
+                    raise RuntimeError(f"Failed to {phase.value} service {role}: {error}")
+                services[role] = service
+            self._startup_abort_event.clear()
+            return services
+        finally:
+            if executor is not None:
+                # A sibling may still be blocked in serve.run(). Let the driver
+                # handle the failure and tear down Serve instead of joining it.
+                executor.shutdown(wait=False, cancel_futures=True)
+
+    def _abort_service_phase(
+        self,
+        phase: ServiceStartupPhase,
+        services: dict[Any, Service],
+        failed_services: Optional[dict[Any, Service]] = None,
+    ) -> None:
+        """Roll back partially-successful services when a phase peer failed.
+
+        DEPLOY successes are alive Ray Serve deployments; hand them to
+        ``self.serve_dict`` so ``Controller.shutdown()`` can dispose SGLang
+        engines and detach handles. ALLOCATE_RESOURCES successes only hold
+        placement groups and have no ``handle`` yet — putting them in
+        ``serve_dict`` would make shutdown ``AttributeError`` on ``handle``, so
+        release their PGs directly here.
+        """
+        failed_services = failed_services or {}
+        if not services and not failed_services:
+            return
+        if phase == ServiceStartupPhase.DEPLOY:
+            self.serve_dict.update(services)
+            for role, service in failed_services.items():
+                self._cleanup_aborted_service(role, service, deploy=True)
+            return
+        seen_pgs = set()
+        for role, service in {**services, **failed_services}.items():
+            pgs = getattr(service, "pgs", None)
+            if pgs is None or getattr(service, "_is_shared_pgs", False):
+                continue
+            pg = pgs[0] if isinstance(pgs, tuple) else pgs
+            if id(pg) in seen_pgs:
+                continue
+            seen_pgs.add(id(pg))
+            try:
+                remove_placement_group(pg)
+            except Exception as e:
+                logger.warning(f"[{role}] Failed to release placement group during phase abort: {e}")
+
+    def _cleanup_aborted_service(self, role: Any, service: Service, *, deploy: bool) -> None:
+        """Release resources for a service that finished after startup
+        abort."""
+        if deploy:
+            try:
+                service._stop_heartbeat_thread()
+            except Exception as e:
+                logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
+            if str(role) == "rollout" and getattr(service, "_deployed", False):
+                try:
+                    rollout_manager = run(service.get_rollout_manager())
+                    ray.get(rollout_manager.dispose.remote(), timeout=30)
+                except Exception as e:
+                    logger.warning(f"[{role}] Failed to dispose rollout manager during phase abort: {e}")
+            if str(role) == str(GENRM_ROLE):
+                for manager in self._get_genrm_managers_for_cleanup(service):
+                    try:
+                        ray.get(manager.shutdown.remote(), timeout=60)
+                    except Exception:
+                        logger.exception("Cannot shut down aborted GenRM manager")
+                    try:
+                        ray.kill(manager)
+                    except Exception:
+                        logger.exception("Cannot kill aborted GenRM manager")
+            try:
+                serve.delete(role)
+            except Exception as e:
+                logger.warning(f"[{role}] Failed to delete deployment during phase abort: {e}")
+        if getattr(service, "_is_shared_pgs", False):
+            return
+        pgs = getattr(service, "pgs", None)
+        if pgs is None:
+            return
+        pg = pgs[0] if isinstance(pgs, tuple) else pgs
+        try:
+            remove_placement_group(pg)
+        except Exception as e:
+            logger.warning(f"[{role}] Failed to release placement group during phase abort: {e}")
 
     def _start_services(self, service_args: list[tuple]) -> list[Any]:
         """Start services, staging deployment only when S3 prefetch needs
@@ -551,12 +988,24 @@ class Controller:
             service_args,
         )
         service_pgs = {role: service.pgs for role, service in prepared_services.items()}
-        model_prefetch_refs = self._start_model_prefetch(service_pgs)
-        services = self._run_service_phase(
-            ServiceStartupPhase.DEPLOY,
-            self._deploy_service_task,
-            list(prepared_services.items()),
-        )
+        try:
+            model_prefetch_refs = self._start_model_prefetch(service_pgs)
+        except Exception:
+            self._abort_service_phase(ServiceStartupPhase.ALLOCATE_RESOURCES, prepared_services)
+            raise
+        try:
+            services = self._run_service_phase(
+                ServiceStartupPhase.DEPLOY,
+                self._deploy_service_task,
+                list(prepared_services.items()),
+            )
+        except Exception:
+            # Allocation covered every role, including deployments cancelled or
+            # never reached after a sibling failed. They are not in serve_dict.
+            for role, service in prepared_services.items():
+                if role not in self.serve_dict:
+                    self._cleanup_aborted_service(role, service, deploy=getattr(service, "_deployed", False))
+            raise
         self.serve_dict.update(services)
         return model_prefetch_refs
 
@@ -744,7 +1193,9 @@ class Controller:
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
+        from relax.core.registry import resolve_algorithm
+
+        algo: dict = resolve_algorithm(self.config)
         ROLES = process_role(self.config)
 
         # Fail-fast on missing SFT producer role; without this the train
@@ -830,16 +1281,20 @@ class Controller:
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
 
-    def _shutdown_static_inference(self) -> None:
-        managers = self._teacher_manager if isinstance(self._teacher_manager, list) else [self._teacher_manager]
-        managers = [manager for manager in managers if manager is not None]
-        genrm = self.serve_dict.get(GENRM_ROLE)
+    def _get_genrm_managers_for_cleanup(self, genrm: Any) -> list:
+        managers = []
         if genrm is not None and getattr(genrm, "_deployed", False):
             for key in getattr(self.config, "_genrm_instances_resolved", {}):
                 try:
                     managers.append(run(asyncio.wait_for(genrm.get_genrm_manager(key), timeout=30)))
                 except Exception:
                     logger.exception("Cannot retrieve GenRM manager during cleanup")
+        return managers
+
+    def _shutdown_static_inference(self) -> None:
+        managers = self._teacher_manager if isinstance(self._teacher_manager, list) else [self._teacher_manager]
+        managers = [manager for manager in managers if manager is not None]
+        managers.extend(self._get_genrm_managers_for_cleanup(self.serve_dict.get(GENRM_ROLE)))
         for manager in managers:
             try:
                 ray.get(manager.shutdown.remote(), timeout=60)
@@ -1027,6 +1482,10 @@ class Controller:
                 try:
                     await asyncio.gather(*task_refs)
                     logger.info("Service task completed successfully")
+                except asyncio.CancelledError as e:
+                    if not self._restarting:
+                        raise
+                    raise RuntimeError("Service task cancelled for recovery") from e
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}")
                 finally:
@@ -1037,6 +1496,8 @@ class Controller:
         while True:
             try:
                 run(run_all_services(resume_existing=resume_existing))
+                if self._restarting:
+                    raise RuntimeError("Service completion interrupted by recovery")
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
@@ -1066,6 +1527,21 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
+    def _dispose_rollout_manager(self, lookup_timeout: float = 5.0, dispose_timeout: float = 35.0) -> bool:
+        """Ask the owning actor to release engines and routers before deleting
+        its deployment."""
+        service = self.serve_dict.get(ROLES.rollout)
+        if service is None:
+            return True
+        try:
+            rollout_manager = run(asyncio.wait_for(service.get_rollout_manager(), timeout=lookup_timeout))
+            ray.get(rollout_manager.dispose.remote(), timeout=dispose_timeout)
+            logger.info("RolloutManager disposal completed in its owning actor.")
+            return True
+        except Exception as e:
+            logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
+            return False
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1075,20 +1551,31 @@ class Controller:
         instead of being orphaned.
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
-        self.stop_health_check()
+        if hasattr(self, "_health_manager"):
+            self.stop_health_check()
 
-        # Shut down rollout engines via RolloutManager.dispose()
-        if ROLES.rollout in self.serve_dict:
+        from relax.engine.sft.runtime import is_i2i_sft
+
+        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+
+            async def stop_image_producer() -> None:
+                await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)
+
             try:
-                rollout_manager = run(self.serve_dict[ROLES.rollout].get_rollout_manager())
-                ray.get(rollout_manager.dispose.remote(), timeout=30)
-                logger.info("RolloutManager disposed — SGLang engines shut down.")
-            except Exception as e:
-                logger.warning(f"Failed to dispose RolloutManager: {e}")
+                run(stop_image_producer())
+            except Exception as exc:
+                logger.warning(f"Image SFT producer shutdown failed: {exc}")
+
+        self._dispose_rollout_manager()
 
         self._shutdown_static_inference()
 
         self._shutdown_agentic_rollout_services()
+
+        try:
+            self._close_data_system()
+        except Exception as e:
+            logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
 
         # Router processes must be terminated explicitly.  They are daemonic,
         # but ``daemon=True`` only reaps through multiprocessing's atexit hook,
@@ -1129,6 +1616,35 @@ class Controller:
         self._health_manager.stop(timeout)
 
     def restart_serve(self, role: str) -> None:
+        """Publish each recovery generation before work that can fail."""
+        while True:
+            self._restart_consumed_event.wait()
+            with self._restart_lock:
+                if not self._restart_consumed_event.is_set():
+                    continue
+                self._restart_consumed_event.clear()
+                self._restarting = True
+                self._restart_done_event.clear()
+                self._restart_error = None
+                self._restart_mode = "global"
+                break
+        try:
+            self._restart_serve(role)
+        except BaseException as exc:
+            self._restart_error = exc
+            logger.exception("Service recovery failed")
+        finally:
+            if self._restart_error is not None:
+                checker = getattr(self._health_manager, "_checker", None)
+                if checker is not None:
+                    checker._stop_event.set()
+                try:
+                    self._cancel_pending_tasks()
+                except BaseException as cancel_error:
+                    logger.warning(f"Failed to cancel tasks after recovery error: {cancel_error}")
+            self._restart_done_event.set()
+
+    def _restart_serve(self, role: str) -> None:
         """Restart a service after it becomes unhealthy.
 
         Global restart (full Controller re-initialization from zero) is triggered when:
@@ -1151,22 +1667,15 @@ class Controller:
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
+        from relax.core.registry import resolve_algorithm
+
+        algo: dict = resolve_algorithm(self.config)
         # Include dynamically added optional roles.
         register_extra_roles(self.config, algo)
         cls = algo.get(role)
         if cls is None:
-            logger.warning(f"No class registered for role '{role}', skipping")
-            return
+            raise RuntimeError(f"No class registered for role '{role}' during recovery")
 
-        # Serialize restart generations. HealthChecker can invoke this callback
-        # repeatedly for several unhealthy roles from one status snapshot; the
-        # training thread must consume the previous generation first.
-        self._restart_consumed_event.wait()
-        self._restart_consumed_event.clear()
-        self._restarting = True
-        self._restart_done_event.clear()
-        self._restart_error = None
         restart_count = self._health_manager.increment_restart_count(role)
         logger.info(f"Restarting {role}, restart count: {restart_count}")
 
@@ -1194,38 +1703,14 @@ class Controller:
                 else f"restart_count({restart_count}) >= 3 for '{role}'"
             )
             logger.warning(f"Triggering global restart due to: {reason}")
-            self._global_restart()
+            self._run_global_restart()
             # _restarting is reset by the main thread after it processes the restart_done_event
         else:
             # Delegate in-place restart to Service (reuses PG, restores step, syncs weights, re-runs task)
             service = self.serve_dict[role]
-            try:
-                service.restart()
-                self._health_manager.mark_healthy(role)
-                logger.info(f"Service '{role}' restarted successfully")
-            except BaseException as e:
-                self._restart_error = e
-                logger.exception(f"Service '{role}' restart failed: {e}")
-            finally:
-                self._restart_done_event.set()
-
-    def _global_restart(self) -> None:
-        """Run a global restart and always release the waiting main thread."""
-        restart_done_event = self._restart_done_event
-        try:
-            self._run_global_restart()
-        except BaseException as e:
-            self._restart_error = e
-            logger.exception(f"[Global Restart] Unhandled restart failure: {e}")
-            # A failure before _run_global_restart reaches its normal cancel
-            # phase must still interrupt the training thread so it can consume
-            # this cycle's error and release the restart-generation handshake.
-            try:
-                self._cancel_pending_tasks()
-            except BaseException as cancel_error:
-                logger.warning(f"[Global Restart] Failed to cancel pending tasks after error: {cancel_error}")
-        finally:
-            restart_done_event.set()
+            service.restart()
+            self._health_manager.mark_healthy(role)
+            logger.info(f"Service '{role}' restarted successfully")
 
     def _run_global_restart(self) -> None:
         """Perform a full global restart by re-initializing the Controller from
@@ -1311,6 +1796,9 @@ class Controller:
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
 
+        # The rollout actor owns router subprocesses; dispose before deleting its handle.
+        self._dispose_rollout_manager()
+
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():
             try:
@@ -1355,7 +1843,7 @@ class Controller:
 
         # --- 1.7 Tear down data system (storage units + controller) ---
         try:
-            tq.close()
+            self._close_data_system()
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 

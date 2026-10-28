@@ -399,7 +399,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
                     ],
                     layout=torch.jagged,
                 ),
-                "raw_reward": torch.nested.nested_tensor(
+                "rewards": torch.nested.nested_tensor(
                     [
                         torch.tensor([1.5]),
                         torch.tensor([2.5]),
@@ -411,7 +411,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
         args=Namespace(),
         tq_client=_TQClient(),
-        data_fields=["response_lengths", "total_lengths", "raw_reward"],
+        data_fields=["response_lengths", "total_lengths", "rewards"],
         batch_size=2,
         partition_id="train_0",
         task_name="ref_log_probs",
@@ -423,7 +423,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     assert batch_meta.size == 2
     assert rollout_data["response_lengths"] == [512, 135]
     assert rollout_data["total_lengths"] == [1309, 842]
-    assert rollout_data["raw_reward"] == [1.5, 2.5]
+    assert rollout_data["rewards"] == [1.5, 2.5]
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):
@@ -497,3 +497,84 @@ def test_tensor_to_python_values_mixed_ragged_rows(monkeypatch):
         [1],
         [2, 3],
     ]
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_sft_token_lengths_count_raw_masks_on_cpu(monkeypatch, as_tensor):
+    stream_module = _load_stream_module(monkeypatch)
+    masks = [[0, 1, 1, 0, 1, 0], [0, 0, 0], [1, 1]]
+    batch = {
+        "total_lengths": [6, 3, 2],
+        "response_lengths": [6, 3, 2],
+        "loss_masks": [torch.tensor(mask) for mask in masks] if as_tensor else masks,
+    }
+    stream_module._add_sft_token_lengths(Namespace(loss_type="sft"), batch)
+    assert batch["learn_lengths"] == [3, 0, 2]
+    assert batch["non_learn_lengths"] == [3, 3, 0]
+    assert batch["response_lengths"] == batch["total_lengths"]  # Keep internal alignment semantics.
+    assert all(
+        total == learn + non_learn
+        for total, learn, non_learn in zip(
+            batch["total_lengths"], batch["learn_lengths"], batch["non_learn_lengths"], strict=True
+        )
+    )
+    # Subsequent postprocessing must reuse CPU counts after masks move to a device.
+    batch["loss_masks"] = [torch.empty(6, device="meta")]
+    stream_module._add_sft_token_lengths(Namespace(loss_type="sft"), batch)
+    assert batch["learn_lengths"] == [3, 0, 2]
+
+
+def test_sft_token_lengths_leave_rl_batch_unchanged(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    batch = {"total_lengths": [6], "loss_masks": [[1, 1]]}
+    stream_module._add_sft_token_lengths(Namespace(loss_type="policy_loss"), batch)
+    assert "learn_lengths" not in batch
+    assert "non_learn_lengths" not in batch
+
+
+@pytest.mark.parametrize(
+    "dynamic_cp, allgather_cp, cp_rank, expected_rows",
+    [
+        (False, False, 0, [6, 7]),
+        (False, False, 1, [0, 1, 2, 3, 4, 5]),
+        (False, True, 1, [0, 1, 2, 3, 4, 5]),
+        (True, False, 0, list(range(8))),
+    ],
+)
+def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
+    monkeypatch, dynamic_cp, allgather_cp, cp_rank, expected_rows
+):
+    stream_module = _load_stream_module(monkeypatch)
+    from relax.backends.megatron import cp_utils
+
+    monkeypatch.setattr(cp_utils, "mpu", stream_module.mpu)
+    monkeypatch.setattr(stream_module.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(stream_module.mpu, "get_context_parallel_rank", lambda: cp_rank)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    token_ids = torch.arange(16).reshape(8, 2) + 2**24
+    log_probs = -torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    rollout_data = {
+        "tokens": [list(range(12))],
+        "total_lengths": [12],
+        "response_lengths": [8],
+        "loss_masks": [[1] * 8],
+        "rollout_log_probs": [list(range(8))],
+        "rollout_topk_token_ids": [token_ids.flatten().tolist()],
+        "rollout_topk_log_probs": [log_probs.flatten().tolist()],
+    }
+    args = Namespace(
+        loss_type="policy_loss",
+        qkv_format="thd",
+        use_opd=False,
+        dynamic_context_parallel=dynamic_cp,
+        allgather_cp=allgather_cp,
+        rollout_top_logprobs_num=2,
+    )
+
+    stream_module.post_process_rollout_data(args, rollout_data)
+
+    assert rollout_data["rollout_topk_token_ids"][0].dtype == torch.long
+    assert rollout_data["rollout_topk_log_probs"][0].dtype == torch.float32
+    torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
+    torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
+    assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
